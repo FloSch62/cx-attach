@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from ..config import DEFAULT_CORE_NS, DEFAULT_TOPO_NS
+from ..cli.options import (
+    DEFAULT_CORE_NS,
+    DEFAULT_TOPO_NS,
+    CoreNamespaceOption,
+    TopologyNamespaceOption,
+)
 from ..kubectl import CommandError
-from ..options import CoreNamespaceOption, TopologyNamespaceOption
 from ..topology import remove_sim_spec
 from .utils import handle_cli_error
 

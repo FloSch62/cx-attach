@@ -15,8 +15,8 @@ dependencies = [
 authors = [{ name = "Florian Schwarz" }]
 
 [project.scripts]
-cx-attach = "cx_attach.cli:app"
-cx_attach = "cx_attach.cli:app"
+cx-attach = "cx_attach.cli.main:app"
+cx_attach = "cx_attach.cli.main:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cx_attach"]

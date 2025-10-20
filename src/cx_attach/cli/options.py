@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Annotated
 
 import typer
+
+DEFAULT_TOPO_NS = os.environ.get("TOPO_NS", "eda")
+DEFAULT_CORE_NS = os.environ.get("CORE_NS", "eda-system")
 
 TopologyOption = Annotated[
     Path | None,
@@ -58,6 +62,8 @@ CoreNamespaceOption = Annotated[
 
 
 __all__ = [
+    "DEFAULT_CORE_NS",
+    "DEFAULT_TOPO_NS",
     "CoreNamespaceOption",
     "SpecOption",
     "TopologyNamespaceOption",

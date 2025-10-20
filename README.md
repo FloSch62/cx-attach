@@ -9,7 +9,6 @@ Typer-based CLI that loads simple simulation definitions into the EDA toolbox, m
 
 ## Quick Start
 ```bash
-cd cx-attach
 uv run cx_attach apply --spec examples/demo_sim.yaml
 ```
 
@@ -17,7 +16,6 @@ The command snapshots existing `TopoNode`/`TopoLink` resources in the namespace 
 
 To clear the attachments and reset the ConfigMaps:
 ```bash
-cd cx-attach
 uv run cx_attach remove
 ```
 

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from ..config import DEFAULT_CORE_NS, DEFAULT_TOPO_NS
-from ..kubectl import CommandError
-from ..options import (
+from ..cli.options import (
+    DEFAULT_CORE_NS,
+    DEFAULT_TOPO_NS,
     CoreNamespaceOption,
     SpecOption,
     TopologyNamespaceOption,
     TopologyOption,
 )
+from ..kubectl import CommandError
 from ..topology import apply_topology
 from .utils import handle_cli_error
 
