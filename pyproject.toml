@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "edge-attach"
+version = "0.1.0"
+description = "Typer CLI for wiring simulation containers to fabric edge interfaces."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer==0.19.2",
+    "PyYAML>=6.0",
+]
+authors = [{ name = "EDA Telemetry Lab" }]
+
+[project.scripts]
+edge-attach = "edge_attach.cli:app"
+edge_attach = "edge_attach.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/edge_attach"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "README.md",
+    "examples",
+    "src/edge_attach",
+]
