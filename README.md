@@ -1,4 +1,4 @@
-# Edge Attach Utility
+# CX Attach Utility
 
 Typer-based CLI that loads simple simulation definitions into the EDA toolbox, mirroring the behaviour of `cx/topology/topo.sh` but with a concise YAML format and `pyproject.toml` managed through `uv`.
 
@@ -9,16 +9,16 @@ Typer-based CLI that loads simple simulation definitions into the EDA toolbox, m
 
 ## Quick Start
 ```bash
-cd edge_attach
-uv run edge_attach apply --spec examples/demo_sim.yaml
+cd cx-attach
+uv run cx_attach apply --spec examples/demo_sim.yaml
 ```
 
 The command snapshots existing `TopoNode`/`TopoLink` resources in the namespace before invoking `api-server-topo`, ensuring the fabric nodes remain untouched. Node names in your YAML must match the live fabric (the CLI validates this). If you need to push a fresh fabric topology definition, add `--topology <path-to-topology.yaml>`.
 
 To clear the attachments and reset the ConfigMaps:
 ```bash
-cd edge_attach
-uv run edge_attach remove
+cd cx-attach
+uv run cx_attach remove
 ```
 
 Environment variables `TOPO_NS` and `CORE_NS` override the default namespaces (`eda` and `eda-system`). You can also pass `--topology-namespace` / `--core-namespace` options explicitly. The `remove` command only resets the `eda-topology-sim` ConfigMap and reuses the current `TopoNode` / `TopoLink` snapshot so fabric nodes persist.

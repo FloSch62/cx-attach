@@ -1,4 +1,4 @@
-"""Module entry-point for `python -m edge_attach`."""
+"""Module entry-point for `python -m cx_attach`."""
 
 from .cli import app
 

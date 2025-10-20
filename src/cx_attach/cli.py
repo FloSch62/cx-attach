@@ -1,13 +1,14 @@
-from __future__ import annotations
-
 """Typer-based CLI for attaching simulation nodes to fabric edge interfaces."""
+
+from __future__ import annotations
 
 import json
 import os
 import subprocess
 import tempfile
+from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
-from typing import Any, Iterable, Mapping, MutableMapping
+from typing import Annotated, Any
 
 import typer
 import yaml
@@ -16,6 +17,56 @@ DEFAULT_TOPO_NS = os.environ.get("TOPO_NS", "eda")
 DEFAULT_CORE_NS = os.environ.get("CORE_NS", "eda-system")
 
 app = typer.Typer(help="Manage edge simulation attachments for EDA topologies.")
+
+TopologyOption = Annotated[
+    Path | None,
+    typer.Option(
+        None,
+        "--topology",
+        "-t",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help=(
+            "Optional path to the fabric topology YAML file; omit to leave existing "
+            "fabric untouched."
+        ),
+    ),
+]
+SpecOption = Annotated[
+    Path,
+    typer.Option(
+        ...,
+        "--spec",
+        "-s",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="Path to the simplified simulation spec YAML file",
+    ),
+]
+TopologyNamespaceOption = Annotated[
+    str,
+    typer.Option(
+        DEFAULT_TOPO_NS,
+        "--topology-namespace",
+        "-n",
+        envvar="TOPO_NS",
+        help="Namespace containing the EDA topology ConfigMaps.",
+    ),
+]
+CoreNamespaceOption = Annotated[
+    str,
+    typer.Option(
+        DEFAULT_CORE_NS,
+        "--core-namespace",
+        "-c",
+        envvar="CORE_NS",
+        help="Namespace hosting the eda-toolbox pod.",
+    ),
+]
 
 
 class CommandError(RuntimeError):
@@ -29,8 +80,7 @@ def run_command(cmd: Iterable[str], *, input_text: str | None = None) -> str:
         list(cmd),
         input=input_text,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if process.returncode != 0:
@@ -132,10 +182,9 @@ def normalize_sim_spec(
         return dict(raw)
 
     spec_section: MutableMapping[str, Any]
-    if "spec" in raw:
-        spec_section = dict(raw.get("spec") or {})
-    else:
-        spec_section = dict(raw)
+    spec_section = (
+        dict(raw.get("spec") or {}) if "spec" in raw else dict(raw)
+    )
 
     sim_nodes = ensure_list(spec_section.get("simNodes"), key="simNodes")
     topology = ensure_list(spec_section.get("topology"), key="topology")
@@ -232,6 +281,64 @@ def load_namespace_resource(namespace: str, resource: str) -> list[dict[str, Any
     return items
 
 
+def _build_node_entry(node: Mapping[str, Any]) -> dict[str, Any] | None:
+    metadata = node.get("metadata") if isinstance(node, Mapping) else None
+    spec = node.get("spec") if isinstance(node, Mapping) else None
+    if not isinstance(metadata, Mapping):
+        return None
+
+    name = metadata.get("name")
+    if not isinstance(name, str):
+        return None
+
+    entry: dict[str, Any] = {"name": name}
+
+    labels = metadata.get("labels")
+    if isinstance(labels, Mapping) and labels:
+        entry["labels"] = dict(labels)
+
+    spec_mapping = spec if isinstance(spec, Mapping) else {}
+    node_spec: dict[str, Any] = {
+        key: spec_mapping[key]
+        for key in ("operatingSystem", "platform", "version", "nodeProfile")
+        if key in spec_mapping
+    }
+    for optional in ("npp", "productionAddress"):
+        if optional in spec_mapping:
+            node_spec[optional] = spec_mapping[optional]
+    if node_spec:
+        entry["spec"] = node_spec
+
+    return entry
+
+
+def _build_link_entry(link: Mapping[str, Any]) -> dict[str, Any] | None:
+    metadata = link.get("metadata") if isinstance(link, Mapping) else None
+    spec = link.get("spec") if isinstance(link, Mapping) else None
+    if not isinstance(metadata, Mapping):
+        return None
+
+    name = metadata.get("name")
+    if not isinstance(name, str):
+        return None
+
+    entry: dict[str, Any] = {"name": name}
+
+    labels = metadata.get("labels")
+    if isinstance(labels, Mapping) and labels:
+        entry["labels"] = dict(labels)
+
+    spec_mapping = spec if isinstance(spec, Mapping) else {}
+    if "encapType" in spec_mapping:
+        entry["encapType"] = spec_mapping["encapType"]
+
+    links_value = spec_mapping.get("links")
+    if isinstance(links_value, list):
+        entry.setdefault("spec", {})["links"] = links_value
+
+    return entry
+
+
 def fetch_existing_topology(namespace: str) -> dict[str, Any]:
     nodes_raw = load_namespace_resource(namespace, "toponodes")
     if not nodes_raw:
@@ -241,52 +348,17 @@ def fetch_existing_topology(namespace: str) -> dict[str, Any]:
 
     links_raw = load_namespace_resource(namespace, "topolinks")
 
-    nodes: list[dict[str, Any]] = []
-    for node in nodes_raw:
-        metadata = node.get("metadata", {})
-        spec = node.get("spec", {})
-        name = metadata.get("name")
-        if not name:
-            continue
+    nodes = [
+        node_entry
+        for raw in nodes_raw
+        if (node_entry := _build_node_entry(raw)) is not None
+    ]
 
-        node_entry: dict[str, Any] = {"name": name}
-        labels = metadata.get("labels") or {}
-        if labels:
-            node_entry["labels"] = labels
-
-        node_spec: dict[str, Any] = {}
-        for key in ("operatingSystem", "platform", "version", "nodeProfile"):
-            if key in spec:
-                node_spec[key] = spec[key]
-        if "npp" in spec:
-            node_spec["npp"] = spec["npp"]
-        if "productionAddress" in spec:
-            node_spec["productionAddress"] = spec["productionAddress"]
-        if node_spec:
-            node_entry["spec"] = node_spec
-
-        nodes.append(node_entry)
-
-    links: list[dict[str, Any]] = []
-    for link in links_raw:
-        metadata = link.get("metadata", {})
-        spec = link.get("spec", {})
-        name = metadata.get("name")
-        if not name:
-            continue
-
-        link_entry: dict[str, Any] = {"name": name}
-        labels = metadata.get("labels") or {}
-        if labels:
-            link_entry["labels"] = labels
-
-        if "encapType" in spec:
-            link_entry["encapType"] = spec["encapType"]
-
-        if "links" in spec:
-            link_entry.setdefault("spec", {})["links"] = spec["links"]
-
-        links.append(link_entry)
+    links = [
+        link_entry
+        for raw in links_raw
+        if (link_entry := _build_link_entry(raw)) is not None
+    ]
 
     return {"items": [{"spec": {"nodes": nodes, "links": links}}]}
 
@@ -400,41 +472,10 @@ def _handle_error(exc: Exception) -> None:
 
 @app.command()
 def apply(
-    
-    topology: Path | None = typer.Option(
-        None,
-        "--topology",
-        "-t",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        help="Optional path to the fabric topology YAML file; omit to leave existing fabric untouched.",
-    ),
-    spec: Path = typer.Option(
-        ...,
-        "--spec",
-        "-s",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        help="Path to the simplified simulation spec YAML file",
-    ),
-    topology_namespace: str = typer.Option(
-        DEFAULT_TOPO_NS,
-        "--topology-namespace",
-        "-n",
-        envvar="TOPO_NS",
-        help="Namespace containing the EDA topology ConfigMaps.",
-    ),
-    core_namespace: str = typer.Option(
-        DEFAULT_CORE_NS,
-        "--core-namespace",
-        "-c",
-        envvar="CORE_NS",
-        help="Namespace hosting the eda-toolbox pod.",
-    ),
+    topology: TopologyOption,
+    spec: SpecOption,
+    topology_namespace: TopologyNamespaceOption,
+    core_namespace: CoreNamespaceOption,
 ) -> None:
     """Load topology plus simulation attachments defined in YAML."""
 
@@ -451,20 +492,8 @@ def apply(
 
 @app.command()
 def remove(
-    topology_namespace: str = typer.Option(
-        DEFAULT_TOPO_NS,
-        "--topology-namespace",
-        "-n",
-        envvar="TOPO_NS",
-        help="Namespace containing the EDA topology ConfigMaps.",
-    ),
-    core_namespace: str = typer.Option(
-        DEFAULT_CORE_NS,
-        "--core-namespace",
-        "-c",
-        envvar="CORE_NS",
-        help="Namespace hosting the eda-toolbox pod.",
-    ),
+    topology_namespace: TopologyNamespaceOption,
+    core_namespace: CoreNamespaceOption,
 ) -> None:
     """Remove simulation attachments without altering the fabric topology."""
 

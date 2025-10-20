@@ -1,4 +1,4 @@
-"""Edge Attach package."""
+"""CX Attach package."""
 
 from .cli import app
 
