@@ -1,0 +1,68 @@
+items:
+- spec:
+    nodes:
+    - name: leaf1
+      labels:
+        eda.nokia.com/role: leaf
+        eda.nokia.com/security-profile: managed
+      spec:
+        operatingSystem: srl
+        platform: 7220 IXR-D2L
+        version: 25.7.2
+        nodeProfile: srlinux-ghcr-25.7.2
+        npp:
+          mode: normal
+        productionAddress: {}
+    - name: leaf2
+      labels:
+        eda.nokia.com/role: leaf
+        eda.nokia.com/security-profile: managed
+      spec:
+        operatingSystem: srl
+        platform: 7220 IXR-D2L
+        version: 25.7.2
+        nodeProfile: srlinux-ghcr-25.7.2
+        npp:
+          mode: normal
+        productionAddress: {}
+    - name: spine1
+      labels:
+        eda.nokia.com/role: spine
+        eda.nokia.com/security-profile: managed
+      spec:
+        operatingSystem: srl
+        platform: 7220 IXR-D3L
+        version: 25.7.2
+        nodeProfile: srlinux-ghcr-25.7.2
+        npp:
+          mode: normal
+        productionAddress: {}
+    links:
+    - name: leaf1-spine1
+      labels:
+        eda.nokia.com/role: interSwitch
+      spec:
+        links:
+        - local:
+            interface: ethernet-1-49
+            interfaceResource: leaf1-ethernet-1-49
+            node: leaf1
+          remote:
+            interface: ethernet-1-1
+            interfaceResource: spine1-ethernet-1-1
+            node: spine1
+          type: interSwitch
+    - name: leaf2-spine1
+      labels:
+        eda.nokia.com/role: interSwitch
+      spec:
+        links:
+        - local:
+            interface: ethernet-1-49
+            interfaceResource: leaf2-ethernet-1-49
+            node: leaf2
+          remote:
+            interface: ethernet-1-2
+            interfaceResource: spine1-ethernet-1-2
+            node: spine1
+          type: interSwitch

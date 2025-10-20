@@ -48,6 +48,7 @@ Both `cx-attach` and `cx_attach` entry points are exposed. Prefix commands with 
 
 ```bash
 uv run cx_attach apply --spec examples/demo_sim.yaml
+uv run cx_attach apply --spec examples/demo_sim.yaml --topology examples/demo_topology.yaml
 uv run cx_attach remove
 ```
 
@@ -99,6 +100,76 @@ topology:
 ```
 
 Validation ensures required keys exist and, when a fabric snapshot is available, that each `node` appears in the current topology.
+
+## Topology file format
+
+When you pass `--topology`, the CLI expects the same nested structure exposed by the cluster (items → spec → nodes/links). The sample file `examples/demo_topology.yaml` defines two nodes connected by a single fabric link:
+
+```yaml
+items:
+  - spec:
+      nodes:
+        - name: leaf1
+          labels:
+            eda.nokia.com/role: leaf
+            eda.nokia.com/security-profile: managed
+          spec:
+            operatingSystem: srl
+            platform: 7220 IXR-D2L
+            version: 25.7.2
+            nodeProfile: srlinux-ghcr-25.7.2
+            npp:
+              mode: normal
+        - name: leaf2
+          labels:
+            eda.nokia.com/role: leaf
+            eda.nokia.com/security-profile: managed
+          spec:
+            operatingSystem: srl
+            platform: 7220 IXR-D2L
+            version: 25.7.2
+            nodeProfile: srlinux-ghcr-25.7.2
+            npp:
+              mode: normal
+        - name: spine1
+          labels:
+            eda.nokia.com/role: spine
+            eda.nokia.com/security-profile: managed
+          spec:
+            operatingSystem: srl
+            platform: 7220 IXR-D3L
+            version: 25.7.2
+            nodeProfile: srlinux-ghcr-25.7.2
+            npp:
+              mode: normal
+      links:
+        - name: leaf1-spine1
+          labels:
+            eda.nokia.com/role: interSwitch
+          spec:
+            links:
+              - local:
+                  interface: ethernet-1-49
+                  node: leaf1
+                remote:
+                  interface: ethernet-1-1
+                  node: spine1
+                type: interSwitch
+        - name: leaf2-spine1
+          labels:
+            eda.nokia.com/role: interSwitch
+          spec:
+            links:
+              - local:
+                  interface: ethernet-1-49
+                  node: leaf2
+                remote:
+                  interface: ethernet-1-2
+                  node: spine1
+                type: interSwitch
+```
+
+See `examples/demo_topology.yaml` for the trimmed snapshot captured from your cluster. Ensure the node names match your target fabric so simulation validation succeeds.
 
 ## Typical workflow
 
