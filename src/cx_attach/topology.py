@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import typer
+import yaml
 
 from .kubectl import (
     copy_to_toolbox,
@@ -102,6 +104,107 @@ def fetch_existing_topology(namespace: str) -> dict[str, Any]:
     return {"items": [{"spec": {"nodes": nodes, "links": links}}]}
 
 
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug or "sim"
+
+
+def _collect_sim_attachments(sim_spec: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    attachments: list[Mapping[str, Any]] = []
+    items = sim_spec.get("items") if isinstance(sim_spec, Mapping) else None
+    if not isinstance(items, list):
+        return attachments
+
+    for item in items:
+        spec = item.get("spec") if isinstance(item, Mapping) else None
+        topology = spec.get("topology") if isinstance(spec, Mapping) else None
+        if isinstance(topology, list):
+            attachments.extend(
+                entry for entry in topology if isinstance(entry, Mapping)
+            )
+    return attachments
+
+
+def _ensure_edge_topolinks(
+    *,
+    topo_ns: str,
+    attachments: list[Mapping[str, Any]],
+) -> bool:
+    if not attachments:
+        return False
+
+    existing_links = {
+        item.get("metadata", {}).get("name")
+        for item in load_namespace_resource(topo_ns, "topolinks")
+        if isinstance(item, Mapping)
+    }
+
+    manifests: list[str] = []
+    for entry in attachments:
+        node = entry.get("node")
+        interface = entry.get("interface")
+        sim_node = entry.get("simNode")
+        sim_interface = entry.get("simNodeInterface")
+
+        if not all(
+            isinstance(value, str) and value
+            for value in (node, interface, sim_node, sim_interface)
+        ):
+            continue
+
+        link_name = "-".join(
+            (
+                _slugify(node),
+                _slugify(interface),
+                _slugify(sim_node),
+            )
+        )
+
+        if link_name in existing_links:
+            continue
+
+        manifest = {
+            "apiVersion": "core.eda.nokia.com/v1",
+            "kind": "TopoLink",
+            "metadata": {
+                "name": link_name,
+                "namespace": topo_ns,
+                "labels": {
+                    "eda.nokia.com/role": "edge",
+                    "eda.nokia.com/simtopology": "true",
+                },
+            },
+            "spec": {
+                "links": [
+                    {
+                        "type": "edge",
+                        "local": {
+                            "node": node,
+                            "interface": interface,
+                            "interfaceResource": f"{_slugify(node)}-{_slugify(interface)}",
+                        },
+                        "remote": {
+                            "node": sim_node,
+                            "interface": sim_interface,
+                            "interfaceResource": f"{_slugify(sim_node)}-{_slugify(sim_interface)}",
+                        },
+                    }
+                ]
+            },
+        }
+
+        manifests.append(yaml.safe_dump(manifest, sort_keys=False))
+        existing_links.add(link_name)
+
+    if not manifests:
+        return False
+
+    payload = "---\n".join(manifests)
+    run_command(("kubectl", "apply", "-f", "-"), input_text=payload)
+    return True
+
+
 def extract_node_names(topology_data: Mapping[str, Any]) -> set[str]:
     items = topology_data.get("items") if isinstance(topology_data, Mapping) else None
     if not isinstance(items, list):
@@ -151,6 +254,11 @@ def apply_topology(
     raw_spec = read_yaml(sim_spec_file)
     normalized_sim = normalize_sim_spec(raw_spec, known_nodes=known_nodes)
 
+    attachments = _collect_sim_attachments(normalized_sim)
+    if _ensure_edge_topolinks(topo_ns=topo_ns, attachments=attachments):
+        typer.echo("Created missing edge TopoLink resources for simulation attachments")
+        topology_data = fetch_existing_topology(topo_ns)
+
     toolbox_pod = find_toolbox_pod(core_ns)
     typer.echo(f"Using toolbox pod {core_ns}/{toolbox_pod}")
 
@@ -192,6 +300,20 @@ data:
 """
     typer.echo(f"Resetting eda-topology-sim ConfigMap in namespace {topo_ns}")
     run_command(("kubectl", "-n", topo_ns, "apply", "-f", "-"), input_text=wipe_sim)
+
+    typer.echo("Deleting edge TopoLink resources created for simulations")
+    run_command(
+        (
+            "kubectl",
+            "-n",
+            topo_ns,
+            "delete",
+            "topolinks",
+            "-l",
+            "eda.nokia.com/simtopology=true",
+            "--ignore-not-found",
+        )
+    )
 
     topology_data = fetch_existing_topology(topo_ns)
 
