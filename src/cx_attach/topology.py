@@ -40,6 +40,7 @@ class NodeInterfaceConfig:
     interface: str
     ip_address: str
     vlan: str | None
+    gateway: str | None
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,7 @@ def _render_simnode(
             interface=interface,
             ip_address=node.ip_address,
             vlan=vlan,
+            gateway=node.gateway,
         )
 
     return manifest, node_config
@@ -171,24 +173,44 @@ def _render_simlink(
     attachment: AttachmentSpec,
     namespace: str,
 ) -> dict[str, object]:
-    link_name = "-".join(
-        (
+    link_name_parts = [
+        _slugify(attachment.fabric_node),
+        _slugify(attachment.fabric_interface),
+        _slugify(attachment.sim_node),
+    ]
+    if attachment.vlan:
+        link_name_parts.append(_slugify(attachment.vlan))
+    link_name = "-".join(link_name_parts)
+
+    local_interface_resource = "-".join(
+        part
+        for part in (
             _slugify(attachment.fabric_node),
             _slugify(attachment.fabric_interface),
-            _slugify(attachment.sim_node),
+            _slugify(attachment.vlan) if attachment.vlan else None,
         )
+        if part
+    )
+    sim_interface_resource = "-".join(
+        part
+        for part in (
+            _slugify(attachment.sim_node),
+            _slugify(attachment.sim_interface),
+            _slugify(attachment.vlan) if attachment.vlan else None,
+        )
+        if part
     )
 
     spec_link = {
         "local": {
             "node": attachment.fabric_node,
             "interface": attachment.fabric_interface,
-            "interfaceResource": f"{_slugify(attachment.fabric_node)}-{_slugify(attachment.fabric_interface)}",
+            "interfaceResource": local_interface_resource,
         },
         "sim": {
             "node": attachment.sim_node,
             "interface": attachment.sim_interface,
-            "interfaceResource": f"{_slugify(attachment.sim_node)}-{_slugify(attachment.sim_interface)}",
+            "interfaceResource": sim_interface_resource,
         },
     }
 
@@ -217,8 +239,12 @@ def _render_topolink(*, attachment: AttachmentSpec, namespace: str) -> dict[str,
         )
     )
 
-    local_interface_resource = f"{_slugify(attachment.fabric_node)}-{_slugify(attachment.fabric_interface)}"
-    remote_interface_resource = f"{_slugify(attachment.sim_node)}-{_slugify(attachment.sim_interface)}"
+    local_interface_resource = (
+        f"{_slugify(attachment.fabric_node)}-{_slugify(attachment.fabric_interface)}"
+    )
+    remote_interface_resource = (
+        f"{_slugify(attachment.sim_node)}-{_slugify(attachment.sim_interface)}"
+    )
 
     return {
         "apiVersion": "core.eda.nokia.com/v1",
@@ -251,11 +277,23 @@ def _render_topolink(*, attachment: AttachmentSpec, namespace: str) -> dict[str,
     }
 
 
+def _merge_node_configs(*config_sets: Iterable[NodeInterfaceConfig]) -> list[NodeInterfaceConfig]:
+    merged: dict[tuple[str, str, str | None, str], NodeInterfaceConfig] = {}
+    for configs in config_sets:
+        for config in configs:
+            key = (config.name, config.interface, config.vlan, config.ip_address)
+            existing = merged.get(key)
+            if existing is None or (existing.gateway is None and config.gateway):
+                merged[key] = config
+    return list(merged.values())
+
+
 def _render_bundle(spec: SimulationSpec, *, namespace: str) -> RenderedBundle:
     attachments_grouped = _attachments_by_node(spec.attachments)
     documents: list[str] = []
     summaries: list[ResourceSummary] = []
-    node_configs: list[NodeInterfaceConfig] = []
+    base_node_configs: list[NodeInterfaceConfig] = []
+    attachment_node_configs: list[NodeInterfaceConfig] = []
 
     for node in spec.ordered_nodes:
         attachments = attachments_grouped.get(node.name, [])
@@ -267,7 +305,7 @@ def _render_bundle(spec: SimulationSpec, *, namespace: str) -> RenderedBundle:
         documents.append(yaml.safe_dump(manifest, sort_keys=False).rstrip())
         summaries.append(ResourceSummary(kind="SimNode", name=node.name))
         if config is not None:
-            node_configs.append(config)
+            base_node_configs.append(config)
 
     for attachment in spec.attachments:
         simlink_manifest = _render_simlink(
@@ -279,12 +317,35 @@ def _render_bundle(spec: SimulationSpec, *, namespace: str) -> RenderedBundle:
             ResourceSummary(kind="SimLink", name=simlink_manifest["metadata"]["name"])
         )
 
+    seen_topo_pairs: set[tuple[str, str, str, str]] = set()
+
     for attachment in spec.attachments:
-        topolink_manifest = _render_topolink(attachment=attachment, namespace=namespace)
-        documents.append(yaml.safe_dump(topolink_manifest, sort_keys=False).rstrip())
-        summaries.append(
-            ResourceSummary(kind="TopoLink", name=topolink_manifest["metadata"]["name"])
+        pair = (
+            attachment.fabric_node,
+            attachment.fabric_interface,
+            attachment.sim_node,
+            attachment.sim_interface,
         )
+        if pair not in seen_topo_pairs:
+            seen_topo_pairs.add(pair)
+            topolink_manifest = _render_topolink(attachment=attachment, namespace=namespace)
+            documents.append(yaml.safe_dump(topolink_manifest, sort_keys=False).rstrip())
+            summaries.append(
+                ResourceSummary(kind="TopoLink", name=topolink_manifest["metadata"]["name"])
+            )
+
+        if attachment.ip_address:
+            attachment_node_configs.append(
+                NodeInterfaceConfig(
+                    name=attachment.sim_node,
+                    interface=attachment.sim_interface,
+                    ip_address=attachment.ip_address,
+                    vlan=attachment.vlan,
+                    gateway=attachment.gateway,
+                )
+            )
+
+    node_configs = _merge_node_configs(base_node_configs, attachment_node_configs)
 
     manifest_text = "\n---\n".join(documents) + "\n"
     sim_nodes = [node.name for node in spec.ordered_nodes]
@@ -404,11 +465,17 @@ def _configure_linux_interfaces(
                 f" && ip addr flush dev {vlan_iface}"
                 f" && ip addr add {config.ip_address} dev {vlan_iface}"
             )
+            route_iface = vlan_iface
         else:
             command_str = (
                 f"ip addr flush dev {config.interface}"
                 f" && ip addr add {config.ip_address} dev {config.interface}"
                 f" && ip link set {config.interface} up"
+            )
+            route_iface = config.interface
+        if config.gateway:
+            command_str += (
+                f" && ip route replace default via {config.gateway} dev {route_iface}"
             )
         deadline = time.time() + 180
         while True:

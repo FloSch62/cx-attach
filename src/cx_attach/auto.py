@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
-from ipaddress import IPv4Interface
+from ipaddress import IPv4Interface, IPv4Network
 from typing import Any
 
 from .kubectl import CommandError, run_command
@@ -29,6 +29,7 @@ class AutoAttachment:
     fabric_interface: str
     sim_name: str
     ip_address: str | None
+    gateway: str | None
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,40 @@ class VlanDefinition:
     vlan_name: str
     vlan_id: str | None
     selectors: list[str]
-    ip_pool: Iterator[str] | None
+    ip_pool: "IpPool" | None
+
+
+@dataclass(frozen=True)
+class IpPool:
+    """IP allocation details sourced from an IRB interface definition."""
+
+    addresses: Iterator[str]
+    gateway: str | None
+
+
+def _mac_vlan_network(vlan_id: str) -> IPv4Network | None:
+    try:
+        value = int(vlan_id)
+    except (TypeError, ValueError):
+        return None
+    second_octet = 16 + (value // 256)
+    third_octet = value % 256
+    if not (0 <= second_octet <= 255 and 0 <= third_octet <= 255):
+        return None
+    cidr = f"172.{second_octet}.{third_octet}.0/24"
+    return IPv4Network(cidr)
+
+
+def _mac_vlan_allocator(vlan_id: str) -> Iterator[str] | None:
+    network = _mac_vlan_network(vlan_id)
+    if network is None:
+        return None
+
+    def _generator() -> Iterator[str]:
+        for host in network.hosts():
+            yield f"{host}/{network.prefixlen}"
+
+    return _generator()
 
 
 def _load_resource_items(namespace: str, resource: str) -> list[dict[str, Any]]:
@@ -125,8 +159,8 @@ def _selectors_from_vlan_spec(vlan_spec: dict[str, Any]) -> list[str]:
     return []
 
 
-def _build_ip_allocators(virtual_network: dict[str, Any]) -> dict[str, Iterator[str]]:
-    allocators: dict[str, Any] = {}
+def _build_ip_allocators(virtual_network: dict[str, Any]) -> dict[str, IpPool]:
+    allocators: dict[str, IpPool] = {}
     spec = virtual_network.get("spec") if isinstance(virtual_network, dict) else None
     irb_interfaces = spec.get("irbInterfaces") if isinstance(spec, dict) else None
     if not isinstance(irb_interfaces, list):
@@ -156,7 +190,10 @@ def _build_ip_allocators(virtual_network: dict[str, Any]) -> dict[str, Iterator[
                 break
         if primary is None:
             continue
-        allocators[bridge_domain] = _ip_allocator(primary)
+        allocators[bridge_domain] = IpPool(
+            addresses=_ip_allocator(primary),
+            gateway=str(primary.ip),
+        )
     return allocators
 
 
@@ -239,11 +276,11 @@ def _merge_attachments(
     for attachment in attachments:
         grouped.setdefault(attachment.interface_name, []).append(attachment)
 
-    merged: list[AutoAttachment] = []
-    for interface_name, entries in grouped.items():
+    for entries in grouped.values():
         entries_sorted = sorted(
             entries,
             key=lambda att: (
+                0 if att.gateway else 1,
                 0 if att.ip_address else 1,
                 att.vlan_id or "",
                 att.virtual_network,
@@ -256,8 +293,9 @@ def _merge_attachments(
                 node_entry["vlan"] = primary.vlan_id
             if primary.ip_address and "ipAddress" not in node_entry:
                 node_entry["ipAddress"] = primary.ip_address
-        merged.append(primary)
-    return merged
+            if primary.gateway and "gateway" not in node_entry:
+                node_entry["gateway"] = primary.gateway
+    return attachments
 
 
 def _collect_auto_attachments(
@@ -267,6 +305,7 @@ def _collect_auto_attachments(
     attachments: list[AutoAttachment] = []
     sim_nodes: dict[str, dict[str, Any]] = {}
     seen_pairs: set[tuple[str, str]] = set()
+    mac_vlan_allocators: dict[str, Iterator[str]] = {}
 
     for vn in virtual_networks:
         for definition in _gather_vlan_definitions(vn):
@@ -281,11 +320,23 @@ def _collect_auto_attachments(
                     continue
                 sim_name = _generate_sim_name(interface_name)
                 ip_address = None
+                gateway = None
                 if definition.ip_pool is not None:
+                    gateway = definition.ip_pool.gateway
                     try:
-                        ip_address = next(definition.ip_pool)
+                        ip_address = next(definition.ip_pool.addresses)
                     except StopIteration:
                         ip_address = None
+                elif definition.vlan_id:
+                    allocator = mac_vlan_allocators.get(definition.vlan_id)
+                    if allocator is None:
+                        allocator = _mac_vlan_allocator(definition.vlan_id)
+                        mac_vlan_allocators[definition.vlan_id] = allocator or iter(())
+                    if allocator is not None:
+                        try:
+                            ip_address = next(allocator)
+                        except StopIteration:
+                            ip_address = None
 
                 node_entry = sim_nodes.setdefault(
                     sim_name,
@@ -296,10 +347,12 @@ def _collect_auto_attachments(
                         "interface": DEFAULT_SIM_INTERFACE,
                     },
                 )
-                if definition.vlan_id and "vlan" not in node_entry:
+                if definition.vlan_id and (gateway or "vlan" not in node_entry):
                     node_entry["vlan"] = definition.vlan_id
-                if ip_address and "ipAddress" not in node_entry:
+                if ip_address and (gateway or "ipAddress" not in node_entry):
                     node_entry["ipAddress"] = ip_address
+                if gateway:
+                    node_entry["gateway"] = gateway
 
                 attachments.append(
                     AutoAttachment(
@@ -311,7 +364,8 @@ def _collect_auto_attachments(
                         fabric_interface=fabric_interface,
                         sim_name=sim_name,
                         ip_address=ip_address,
-                        )
+                        gateway=gateway,
+                    )
                 )
     attachments = _merge_attachments(sim_nodes, attachments)
     return sim_nodes, attachments
@@ -365,6 +419,7 @@ def _rename_servers(
                 fabric_interface=attachment.fabric_interface,
                 sim_name=new_name,
                 ip_address=attachment.ip_address,
+                gateway=attachment.gateway,
             )
         )
 
@@ -404,6 +459,8 @@ def build_auto_plan(*, topo_ns: str) -> AutoPlan:
                 "simNode": attachment.sim_name,
                 "simNodeInterface": DEFAULT_SIM_INTERFACE,
                 **({"vlan": attachment.vlan_id} if attachment.vlan_id else {}),
+                **({"ipAddress": attachment.ip_address} if attachment.ip_address else {}),
+                **({"gateway": attachment.gateway} if attachment.gateway else {}),
             }
             for attachment in renamed_attachments
         ],
