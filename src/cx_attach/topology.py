@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import tempfile
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ import typer
 import yaml
 
 from .kubectl import (
+    CommandError,
     copy_to_toolbox,
     exec_in_toolbox,
     find_toolbox_pod,
@@ -205,6 +207,171 @@ def _ensure_edge_topolinks(
     return True
 
 
+def _prepare_linux_interface_configs(
+    sim_spec: Mapping[str, Any], attachments: list[Mapping[str, Any]]
+) -> list[dict[str, str]]:
+    interface_map: dict[str, list[str]] = {}
+    attachment_vlans: dict[str, str] = {}
+    for entry in attachments:
+        sim_node = entry.get("simNode")
+        sim_interface = entry.get("simNodeInterface")
+        vlan = entry.get("vlan")
+        if isinstance(sim_node, str) and isinstance(sim_interface, str):
+            interfaces = interface_map.setdefault(sim_node, [])
+            if sim_interface not in interfaces:
+                interfaces.append(sim_interface)
+            if isinstance(vlan, (str, int)) and sim_node not in attachment_vlans:
+                attachment_vlans[sim_node] = str(vlan)
+
+    configs: list[dict[str, str]] = []
+    items = sim_spec.get("items") if isinstance(sim_spec, Mapping) else None
+    if not isinstance(items, list):
+        return configs
+
+    for item in items:
+        spec = item.get("spec") if isinstance(item, Mapping) else None
+        sim_nodes = spec.get("simNodes") if isinstance(spec, Mapping) else None
+        if not isinstance(sim_nodes, list):
+            continue
+        for node in sim_nodes:
+            if not isinstance(node, Mapping):
+                continue
+            name = node.get("name")
+            node_type = node.get("type", "Linux")
+            ip_addr = node.get("ipAddress") or node.get("ip")
+            if not (
+                isinstance(name, str)
+                and isinstance(node_type, str)
+                and node_type.lower() == "linux"
+                and isinstance(ip_addr, str)
+            ):
+                continue
+            interfaces = interface_map.get(name)
+            if not interfaces:
+                continue
+            interface_name = interfaces[0]
+            vlan_value = node.get("vlan")
+            if isinstance(vlan_value, (str, int)):
+                vlan_str = str(vlan_value)
+            else:
+                vlan_str = attachment_vlans.get(name, "")
+            configs.append(
+                {
+                    "name": name,
+                    "interface": interface_name,
+                    "ip": ip_addr,
+                    "vlan": vlan_str,
+                }
+            )
+    return configs
+
+
+def _wait_for_sim_pod(core_ns: str, sim_node: str) -> str:
+    selector = f"cx-pod-name={sim_node}"
+    deadline = time.time() + 180
+    pod_name = ""
+    while time.time() < deadline:
+        try:
+            pod_name = run_command(
+                (
+                    "kubectl",
+                    "-n",
+                    core_ns,
+                    "get",
+                    "pod",
+                    "-l",
+                    selector,
+                    "-o",
+                    "jsonpath={.items[0].metadata.name}",
+                )
+            )
+        except CommandError:
+            pod_name = ""
+
+        if pod_name:
+            try:
+                run_command(
+                    (
+                        "kubectl",
+                        "-n",
+                        core_ns,
+                        "wait",
+                        "--for=condition=Ready",
+                        "pod",
+                        pod_name,
+                        "--timeout=120s",
+                    )
+                )
+            except CommandError:
+                pod_name = ""
+                time.sleep(2)
+                continue
+            return pod_name
+
+        time.sleep(2)
+
+    raise RuntimeError(f"Timed out waiting for pod backing sim node {sim_node}")
+
+
+def _configure_linux_interfaces(
+    *,
+    core_ns: str,
+    configs: list[dict[str, str]],
+) -> None:
+    if not configs:
+        return
+
+    for config in configs:
+        sim_node = config["name"]
+        interface = config["interface"]
+        ip_addr = config["ip"]
+        vlan = config.get("vlan")
+        vlan_str = str(vlan) if vlan is not None and str(vlan).strip() else ""
+        typer.echo(
+            f"Configuring Linux sim node {sim_node} ({interface}{('.' + vlan_str) if vlan_str else ''} -> {ip_addr})"
+        )
+        pod_name = _wait_for_sim_pod(core_ns, sim_node)
+        if vlan_str:
+            vlan_iface = f"{interface}.{vlan_str}"
+            command_str = (
+                f"ip link set {interface} up"
+                f" && (ip link show {vlan_iface} >/dev/null 2>&1 || ip link add link {interface} name {vlan_iface} type vlan id {vlan_str})"
+                f" && ip link set {vlan_iface} up"
+                f" && ip addr flush dev {vlan_iface}"
+                f" && ip addr add {ip_addr} dev {vlan_iface}"
+            )
+        else:
+            command_str = (
+                f"ip addr flush dev {interface}"
+                f" && ip addr add {ip_addr} dev {interface}"
+                f" && ip link set {interface} up"
+            )
+        deadline = time.time() + 180
+        while True:
+            try:
+                run_command(
+                    (
+                        "kubectl",
+                        "-n",
+                        core_ns,
+                        "exec",
+                        pod_name,
+                        "-c",
+                        sim_node,
+                        "--",
+                        "sh",
+                        "-c",
+                        command_str,
+                    )
+                )
+                break
+            except CommandError as exc:
+                if "Device \"" in str(exc) and time.time() < deadline:
+                    time.sleep(2)
+                    continue
+                raise
+
+
 def extract_node_names(topology_data: Mapping[str, Any]) -> set[str]:
     items = topology_data.get("items") if isinstance(topology_data, Mapping) else None
     if not isinstance(items, list):
@@ -255,9 +422,11 @@ def apply_topology(
     normalized_sim = normalize_sim_spec(raw_spec, known_nodes=known_nodes)
 
     attachments = _collect_sim_attachments(normalized_sim)
+    linux_configs = _prepare_linux_interface_configs(normalized_sim, attachments)
     if _ensure_edge_topolinks(topo_ns=topo_ns, attachments=attachments):
         typer.echo("Created missing edge TopoLink resources for simulation attachments")
         topology_data = fetch_existing_topology(topo_ns)
+        known_nodes = extract_node_names(topology_data)
 
     toolbox_pod = find_toolbox_pod(core_ns)
     typer.echo(f"Using toolbox pod {core_ns}/{toolbox_pod}")
@@ -286,6 +455,8 @@ def apply_topology(
         command.extend(["-f", "/tmp/topo.json"])
     command.extend(["-s", "/tmp/simtopo.json"])
     exec_in_toolbox(core_ns, toolbox_pod, command)
+
+    _configure_linux_interfaces(core_ns=core_ns, configs=linux_configs)
 
 
 def remove_sim_spec(*, topo_ns: str, core_ns: str) -> None:
