@@ -51,6 +51,11 @@ class SimNodeSpec:
         return str(value) if isinstance(value, str) and value.strip() else None
 
     @property
+    def gateway(self) -> str | None:
+        value = self.raw.get("gateway")
+        return str(value) if isinstance(value, (str, int)) else None
+
+    @property
     def spec_overrides(self) -> Mapping[str, Any]:
         overrides = self.raw.get("spec")
         if not isinstance(overrides, Mapping):
@@ -71,6 +76,8 @@ class AttachmentSpec:
     sim_node: str
     sim_interface: str
     vlan: str | None
+    ip_address: str | None
+    gateway: str | None
 
 
 @dataclass(frozen=True)
@@ -157,6 +164,10 @@ def _parse_attachments(
             )
         vlan_value = entry.get("vlan") or entry.get("vlanId")
         vlan = str(vlan_value) if isinstance(vlan_value, (str, int)) else None
+        ip_value = entry.get("ipAddress") or entry.get("ip")
+        ip_address = str(ip_value) if isinstance(ip_value, (str, int)) else None
+        gateway_value = entry.get("gateway")
+        gateway = str(gateway_value) if isinstance(gateway_value, (str, int)) else None
         attachments.append(
             AttachmentSpec(
                 fabric_node=fabric_node.strip(),
@@ -164,6 +175,8 @@ def _parse_attachments(
                 sim_node=sim_node.strip(),
                 sim_interface=sim_iface.strip(),
                 vlan=vlan,
+                ip_address=ip_address,
+                gateway=gateway,
             )
         )
     if not attachments:

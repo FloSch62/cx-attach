@@ -5,11 +5,13 @@
 </p>
 
 `cx-attach` turns a compact simulation spec into the full set of
-`SimNode`, `SimLink`, and edge `TopoLink` resources that EDA expects. It renders
-those manifests locally, applies them transactionally via the
-[ETC script](https://github.com/eda-labs/etc-script), waits for the backing pods
-and finalises their VLAN/IP configuration. Teardown follows the same path in
-reverse with `etc delete`.
+`SimNode`, `SimLink`, and edge `TopoLink` resources that EDA expects. When no
+spec is provided, it derives the necessary attachments directly from
+`VirtualNetwork` and `Interface` resources (macvrfs / ipvrfs, selectors,
+auto-assigned IP pools). It renders the manifests locally, applies them
+transactionally via the [ETC script](https://github.com/eda-labs/etc-script),
+waits for the backing pods and finalises their VLAN/IP configuration. Teardown
+follows the same path in reverse with `etc delete`.
 
 ## Overview
 
@@ -60,8 +62,10 @@ Both entry points `cx-attach` and `cx_attach` are exposed. Prefix each invocatio
 with `uv run`:
 
 ```bash
+uv run cx_attach apply --debug                 # auto-generate from VirtualNetwork/Interface resources
 uv run cx_attach apply --spec examples/demo_sim2.yaml
 uv run cx_attach apply --spec examples/demo_sim2.yaml --emit-crds /tmp/sim.yaml
+uv run cx_attach remove                       # auto-generate matching removal bundle
 uv run cx_attach remove --spec examples/demo_sim2.yaml
 ```
 
@@ -69,7 +73,7 @@ uv run cx_attach remove --spec examples/demo_sim2.yaml
 
 | Option | Required | Default | Description |
 |--------|----------|---------|-------------|
-| `--spec`, `-s` | Yes | — | Path to the simplified simulation spec YAML |
+| `--spec`, `-s` | No | auto | Path to the simplified simulation spec; omit to synthesise from `VirtualNetwork` / `Interface` |
 | `--emit-crds` | No | temp file | Persist the rendered CRDs to a path for inspection |
 | `--topology-namespace`, `-n` | No | `eda` | Namespace for `SimNode`/`SimLink`/`TopoLink` resources (`TOPO_NS`) |
 | `--core-namespace`, `-c` | No | `eda-system` | Namespace containing the simulation pods (`CORE_NS`) |
@@ -132,7 +136,28 @@ Per-node values such as `ipAddress` and `vlan` are consumed to configure the
 pods after they start; the CRDs themselves stay minimal and contain only the
 fields accepted by the official schema (`containerImage`, `operatingSystem`,
 optionally `platform`, `version`, `dhcp`, …). Attachments may provide a `vlan`
-override that is also applied during the post-configuration step.
+override that is also applied during the post-configuration step. When no spec
+is supplied, the CLI gathers VLAN selectors from `VirtualNetwork` resources,
+matches them against `Interface` labels, and allocates IPs from the corresponding
+IRB pools. Multiple VLANs per leaf interface are rendered as individual
+`SimLink`/`TopoLink` documents referencing the same simulation node (e.g.
+`server1`).
+
+### Auto-generated specs
+
+Running `cx_attach apply` without `--spec` inspects the target namespace for
+`VirtualNetwork` custom resources and their referenced `Interface` objects:
+
+- Each `interfaceSelector` (e.g. `eda.nokia.com/macvrf1001`) is matched against
+  interface labels to find leaf-facing ports.
+- When an IRB IP pool is available, the allocator hands out one address per
+  leaf interface (skipping the gateway).
+- Every unique fabric interface maps to a single simulation node (`server1`,
+  `server2`, …), even if multiple VLANs land on it. The VLANs become separate
+  `SimLink` / `TopoLink` attachments referencing the same node.
+
+The auto-generated spec is fed straight into ETC; pass `--debug` to inspect the
+rendered YAML or `--emit-crds` to persist it.
 
 ## Typical workflow
 

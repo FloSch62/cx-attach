@@ -12,7 +12,7 @@ DEFAULT_TOPO_NS = os.environ.get("TOPO_NS", "eda")
 DEFAULT_CORE_NS = os.environ.get("CORE_NS", "eda-system")
 
 SpecOption = Annotated[
-    Path,
+    Path | None,
     typer.Option(
         "--spec",
         "-s",
@@ -20,7 +20,7 @@ SpecOption = Annotated[
         file_okay=True,
         dir_okay=False,
         readable=True,
-        help="Path to the simplified simulation spec YAML file",
+        help="Path to the simplified simulation spec YAML file; omit to derive from VirtualNetwork resources",
     ),
 ]
 
