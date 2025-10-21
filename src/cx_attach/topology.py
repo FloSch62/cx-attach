@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import typer
 import yaml
@@ -17,6 +18,7 @@ from .specs import (
     AttachmentSpec,
     SimNodeSpec,
     SimulationSpec,
+    SpecError,
     parse_simulation_spec,
     read_yaml,
 )
@@ -505,14 +507,21 @@ def _verify_cleanup(namespace: str, summaries: Iterable[ResourceSummary]) -> Non
 
 def apply_simulation(
     *,
-    sim_spec_file: Path,
+    sim_spec_file: Path | None,
+    raw_spec: Mapping[str, Any] | None,
     topo_ns: str,
     core_ns: str,
     emit_crds: Path | None,
     debug: bool,
 ) -> None:
-    typer.echo(f"Loading simulation spec from {sim_spec_file}")
-    raw_spec = read_yaml(sim_spec_file)
+    if sim_spec_file is not None:
+        typer.echo(f"Loading simulation spec from {sim_spec_file}")
+        raw_spec = read_yaml(sim_spec_file)
+    elif raw_spec is not None:
+        typer.echo("Using auto-generated simulation spec")
+    else:  # pragma: no cover - defensive guard
+        raise SpecError("Simulation spec is required")
+
     simulation_spec = parse_simulation_spec(raw_spec)
     bundle = _render_bundle(simulation_spec, namespace=topo_ns)
 
@@ -554,14 +563,20 @@ def apply_simulation(
 
 def remove_simulation(
     *,
-    sim_spec_file: Path,
+    sim_spec_file: Path | None,
+    raw_spec: Mapping[str, Any] | None,
     topo_ns: str,
     core_ns: str,
     debug: bool,
 ) -> None:
     del core_ns  # core namespace is unused during deletion but kept for CLI symmetry.
-    typer.echo(f"Loading simulation spec from {sim_spec_file}")
-    raw_spec = read_yaml(sim_spec_file)
+    if sim_spec_file is not None:
+        typer.echo(f"Loading simulation spec from {sim_spec_file}")
+        raw_spec = read_yaml(sim_spec_file)
+    elif raw_spec is not None:
+        typer.echo("Using auto-generated simulation spec for deletion")
+    else:  # pragma: no cover - defensive guard
+        raise SpecError("Simulation spec is required")
     simulation_spec = parse_simulation_spec(raw_spec)
     bundle = _render_bundle(simulation_spec, namespace=topo_ns)
 

@@ -1,0 +1,135 @@
+apiVersion: core.eda.nokia.com/v1
+kind: SimNode
+metadata:
+  name: server1
+  namespace: eda
+  labels:
+    eda.nokia.com/simtopology: "true"
+spec:
+  containerImage: ghcr.io/srl-labs/network-multitool:v0.4.1
+  dhcp: {}
+  operatingSystem: linux
+  port: 57400
+  serialNumberPath: ""
+  versionPath: ""
+---
+apiVersion: core.eda.nokia.com/v1
+kind: SimNode
+metadata:
+  name: server2
+  namespace: eda
+  labels:
+    eda.nokia.com/simtopology: "true"
+spec:
+  containerImage: ghcr.io/srl-labs/network-multitool:v0.4.1
+  dhcp: {}
+  operatingSystem: linux
+  port: 57400
+  serialNumberPath: ""
+  versionPath: ""
+---
+apiVersion: core.eda.nokia.com/v1
+kind: SimNode
+metadata:
+  name: server3
+  namespace: eda
+  labels:
+    eda.nokia.com/simtopology: "true"
+spec:
+  containerImage: ghcr.io/srl-labs/network-multitool:v0.4.1
+  dhcp: {}
+  operatingSystem: linux
+  port: 57400
+  serialNumberPath: ""
+  versionPath: ""
+---
+apiVersion: core.eda.nokia.com/v1
+kind: SimNode
+metadata:
+  name: server4
+  namespace: eda
+  labels:
+    eda.nokia.com/simtopology: "true"
+spec:
+  containerImage: ghcr.io/srl-labs/network-multitool:v0.4.1
+  dhcp: {}
+  operatingSystem: linux
+  port: 57400
+  serialNumberPath: ""
+  versionPath: ""
+---
+apiVersion: core.eda.nokia.com/v1
+kind: SimLink
+metadata:
+  name: demo-leaf-1-ethernet-1-1
+  namespace: eda
+  labels:
+    eda.nokia.com/role: edge
+    eda.nokia.com/simtopology: "true"
+spec:
+  links:
+    - local:
+        node: demo-leaf-1
+        interface: ethernet-1-1
+        interfaceResource: demo-leaf-1-ethernet-1-1
+      sim:
+        node: server1
+        interface: eth1
+        interfaceResource: server1-eth1
+---
+apiVersion: core.eda.nokia.com/v1
+kind: SimLink
+metadata:
+  name: demo-leaf-2-ethernet-1-1
+  namespace: eda
+  labels:
+    eda.nokia.com/role: edge
+    eda.nokia.com/simtopology: "true"
+spec:
+  links:
+    - local:
+        node: demo-leaf-2
+        interface: ethernet-1-1
+        interfaceResource: demo-leaf-2-ethernet-1-1
+      sim:
+        node: server2
+        interface: eth1
+        interfaceResource: server2-eth1
+---
+apiVersion: core.eda.nokia.com/v1
+kind: SimLink
+metadata:
+  name: demo-leaf-3-ethernet-1-1
+  namespace: eda
+  labels:
+    eda.nokia.com/role: edge
+    eda.nokia.com/simtopology: "true"
+spec:
+  links:
+    - local:
+        node: demo-leaf-3
+        interface: ethernet-1-1
+        interfaceResource: demo-leaf-3-ethernet-1-1
+      sim:
+        node: server3
+        interface: eth1
+        interfaceResource: server3-eth1
+---
+apiVersion: core.eda.nokia.com/v1
+kind: SimLink
+metadata:
+  name: demo-leaf-4-ethernet-1-1
+  namespace: eda
+  labels:
+    eda.nokia.com/role: edge
+    eda.nokia.com/simtopology: "true"
+spec:
+  links:
+    - local:
+        node: demo-leaf-4
+        interface: ethernet-1-1
+        interfaceResource: demo-leaf-4-ethernet-1-1
+      sim:
+        node: server4
+        interface: eth1
+        interfaceResource: server4-eth1
