@@ -1,0 +1,41 @@
+simNodes:
+  - name: server1
+    image: ghcr.io/srl-labs/network-multitool:v0.4.1
+    type: Linux
+    ipAddress: 10.10.0.11/24
+    vlan: 1001
+  - name: server2
+    image: ghcr.io/srl-labs/network-multitool:v0.4.1
+    type: Linux
+    ipAddress: 10.10.0.12/24
+    vlan: 1001
+  - name: server3
+    image: ghcr.io/srl-labs/network-multitool:v0.4.1
+    type: Linux
+    ipAddress: 10.10.0.13/24
+    vlan: 1001
+  - name: server4
+    image: ghcr.io/srl-labs/network-multitool:v0.4.1
+    type: Linux
+    ipAddress: 10.10.0.14/24
+    vlan: 1001
+# Attach each sim node to a different switch interface
+# `node` and `interface` refer to the fabric side, while `simNode` & `simNodeInterface`
+# describe how the container's interface joins the link.
+topology:
+  - node: demo-leaf-1
+    interface: ethernet-1-1
+    simNode: server1
+    simNodeInterface: eth1
+  - node: demo-leaf-2
+    interface: ethernet-1-1
+    simNode: server2
+    simNodeInterface: eth1
+  - node: demo-leaf-3
+    interface: ethernet-1-1
+    simNode: server3
+    simNodeInterface: eth1
+  - node: demo-leaf-4
+    interface: ethernet-1-1
+    simNode: server4
+    simNodeInterface: eth1

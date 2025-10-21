@@ -6,6 +6,7 @@ from ..cli.options import (
     DEFAULT_CORE_NS,
     DEFAULT_TOPO_NS,
     CoreNamespaceOption,
+    DebugOption,
     SpecOption,
     TopologyNamespaceOption,
     TopologyOption,
@@ -20,6 +21,7 @@ def apply_command(
     topology: TopologyOption = None,
     topology_namespace: TopologyNamespaceOption = DEFAULT_TOPO_NS,
     core_namespace: CoreNamespaceOption = DEFAULT_CORE_NS,
+    debug: DebugOption = False,
 ) -> None:
     """Load topology plus simulation attachments defined in YAML."""
 
@@ -29,6 +31,7 @@ def apply_command(
             sim_spec_file=spec,
             topo_ns=topology_namespace,
             core_ns=core_namespace,
+            debug=debug,
         )
     except (CommandError, ValueError, FileNotFoundError) as exc:  # pragma: no cover
         handle_cli_error(exc)

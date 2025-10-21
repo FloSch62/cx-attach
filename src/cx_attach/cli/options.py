@@ -60,11 +60,21 @@ CoreNamespaceOption = Annotated[
     ),
 ]
 
+DebugOption = Annotated[
+    bool,
+    typer.Option(
+        "--debug",
+        is_flag=True,
+        help="Enable verbose output and dump debug information.",
+    ),
+]
+
 
 __all__ = [
     "DEFAULT_CORE_NS",
     "DEFAULT_TOPO_NS",
     "CoreNamespaceOption",
+    "DebugOption",
     "SpecOption",
     "TopologyNamespaceOption",
     "TopologyOption",

@@ -6,6 +6,7 @@ from ..cli.options import (
     DEFAULT_CORE_NS,
     DEFAULT_TOPO_NS,
     CoreNamespaceOption,
+    DebugOption,
     TopologyNamespaceOption,
 )
 from ..kubectl import CommandError
@@ -16,11 +17,16 @@ from .utils import handle_cli_error
 def remove_command(
     topology_namespace: TopologyNamespaceOption = DEFAULT_TOPO_NS,
     core_namespace: CoreNamespaceOption = DEFAULT_CORE_NS,
+    debug: DebugOption = False,
 ) -> None:
     """Remove simulation attachments without altering the fabric topology."""
 
     try:
-        remove_sim_spec(topo_ns=topology_namespace, core_ns=core_namespace)
+        remove_sim_spec(
+            topo_ns=topology_namespace,
+            core_ns=core_namespace,
+            debug=debug,
+        )
     except (CommandError, ValueError, FileNotFoundError) as exc:  # pragma: no cover
         handle_cli_error(exc)
 

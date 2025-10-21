@@ -7,6 +7,7 @@ import re
 import tempfile
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -128,13 +129,20 @@ def _collect_sim_attachments(sim_spec: Mapping[str, Any]) -> list[Mapping[str, A
     return attachments
 
 
+@dataclass(slots=True)
+class EdgeLinkPlan:
+    created_manifests: list[str]
+    created_links: list[str]
+    reused_links: list[str]
+
+
 def _ensure_edge_topolinks(
     *,
     topo_ns: str,
     attachments: list[Mapping[str, Any]],
-) -> bool:
+) -> EdgeLinkPlan:
     if not attachments:
-        return False
+        return EdgeLinkPlan([], [], [])
 
     existing_links = {
         item.get("metadata", {}).get("name")
@@ -143,6 +151,8 @@ def _ensure_edge_topolinks(
     }
 
     manifests: list[str] = []
+    created_summaries: list[str] = []
+    reused_summaries: list[str] = []
     for entry in attachments:
         node = entry.get("node")
         interface = entry.get("interface")
@@ -163,7 +173,12 @@ def _ensure_edge_topolinks(
             )
         )
 
+        summary = (
+            f"{link_name}: {node} {interface} -> {sim_node} {sim_interface}"
+        )
+
         if link_name in existing_links:
+            reused_summaries.append(summary)
             continue
 
         manifest = {
@@ -198,13 +213,14 @@ def _ensure_edge_topolinks(
 
         manifests.append(yaml.safe_dump(manifest, sort_keys=False))
         existing_links.add(link_name)
+        created_summaries.append(summary)
 
     if not manifests:
-        return False
+        return EdgeLinkPlan([], created_summaries, reused_summaries)
 
     payload = "---\n".join(manifests)
     run_command(("kubectl", "apply", "-f", "-"), input_text=payload)
-    return True
+    return EdgeLinkPlan(manifests, created_summaries, reused_summaries)
 
 
 def _prepare_linux_interface_configs(
@@ -266,7 +282,7 @@ def _prepare_linux_interface_configs(
     return configs
 
 
-def _wait_for_sim_pod(core_ns: str, sim_node: str) -> str:
+def _wait_for_sim_pod(core_ns: str, sim_node: str, *, debug: bool = False) -> str:
     selector = f"cx-pod-name={sim_node}"
     deadline = time.time() + 180
     pod_name = ""
@@ -306,6 +322,8 @@ def _wait_for_sim_pod(core_ns: str, sim_node: str) -> str:
                 pod_name = ""
                 time.sleep(2)
                 continue
+            if debug:
+                typer.echo(f"Debug: pod ready for {sim_node}: {pod_name}")
             return pod_name
 
         time.sleep(2)
@@ -317,6 +335,7 @@ def _configure_linux_interfaces(
     *,
     core_ns: str,
     configs: list[dict[str, str]],
+    debug: bool = False,
 ) -> None:
     if not configs:
         return
@@ -330,7 +349,7 @@ def _configure_linux_interfaces(
         typer.echo(
             f"Configuring Linux sim node {sim_node} ({interface}{('.' + vlan_str) if vlan_str else ''} -> {ip_addr})"
         )
-        pod_name = _wait_for_sim_pod(core_ns, sim_node)
+        pod_name = _wait_for_sim_pod(core_ns, sim_node, debug=debug)
         if vlan_str:
             vlan_iface = f"{interface}.{vlan_str}"
             command_str = (
@@ -366,10 +385,134 @@ def _configure_linux_interfaces(
                 )
                 break
             except CommandError as exc:
-                if "Device \"" in str(exc) and time.time() < deadline:
+                error_text = str(exc)
+                if (
+                    any(
+                        phrase in error_text
+                        for phrase in ("Device \"", "Cannot find device", "does not exist")
+                    )
+                    and time.time() < deadline
+                ):
                     time.sleep(2)
                     continue
                 raise
+
+
+def _count_topology_elements(topology_data: Mapping[str, Any] | None) -> tuple[int, int]:
+    if not isinstance(topology_data, Mapping):
+        return (0, 0)
+    items = topology_data.get("items")
+    if not isinstance(items, list):
+        return (0, 0)
+    node_count = 0
+    link_count = 0
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        spec = item.get("spec")
+        if not isinstance(spec, Mapping):
+            continue
+        nodes = spec.get("nodes")
+        if isinstance(nodes, list):
+            node_count += len(nodes)
+        links = spec.get("links")
+        if isinstance(links, list):
+            link_count += len(links)
+    return node_count, link_count
+
+
+def _emit_apply_debug(
+    *,
+    topo_ns: str,
+    normalized_sim: Mapping[str, Any],
+    attachments: list[Mapping[str, Any]],
+    linux_configs: list[dict[str, str]],
+    edge_plan: EdgeLinkPlan,
+    topology_snapshot: Mapping[str, Any] | None,
+) -> None:
+    node_count, link_count = _count_topology_elements(topology_snapshot)
+    if node_count or link_count:
+        typer.echo(
+            f"Debug: found {node_count} TopoNodes and {link_count} TopoLinks in namespace {topo_ns}"
+        )
+    typer.echo(
+        f"Debug: merging {len(attachments)} attachment(s) into namespace {topo_ns} (create: {len(edge_plan.created_links)}, reuse: {len(edge_plan.reused_links)})"
+    )
+    typer.echo("Debug: normalized simulation payload")
+    typer.echo(yaml.safe_dump(normalized_sim, sort_keys=False).rstrip())
+    typer.echo("Debug: rendered simtopo.json")
+    typer.echo(json.dumps(normalized_sim, indent=2))
+    if attachments:
+        attachment_dump = yaml.safe_dump(
+            {"attachments": attachments}, sort_keys=False
+        ).rstrip()
+        typer.echo("Debug: desired attachment endpoints")
+        typer.echo(attachment_dump)
+    if edge_plan.reused_links:
+        typer.echo("Debug: reusing existing edge TopoLinks")
+        for summary in edge_plan.reused_links:
+            typer.echo(f"  - {summary}")
+    if edge_plan.created_links:
+        typer.echo("Debug: creating edge TopoLinks")
+        for summary in edge_plan.created_links:
+            typer.echo(f"  - {summary}")
+    if edge_plan.created_manifests:
+        typer.echo("Debug: applied TopoLink manifests")
+        typer.echo("---\n".join(edge_plan.created_manifests).rstrip())
+    if linux_configs:
+        typer.echo("Debug: Linux interface configuration plan")
+        typer.echo(yaml.safe_dump({"interfaces": linux_configs}, sort_keys=False).rstrip())
+
+
+def _print_configmap_data(
+    topo_ns: str,
+    *,
+    name: str,
+    header: str,
+    focus_keys: tuple[str, ...] | None = None,
+) -> None:
+    try:
+        configmap_raw = run_command(
+            (
+                "kubectl",
+                "-n",
+                topo_ns,
+                "get",
+                "configmap",
+                name,
+                "-o",
+                "json",
+            )
+        )
+    except CommandError as exc:  # pragma: no cover
+        typer.echo(f"Debug: failed to read configmap {name}: {exc}")
+        return
+
+    try:
+        payload = json.loads(configmap_raw)
+    except json.JSONDecodeError:  # pragma: no cover
+        typer.echo(f"Debug: configmap {name} payload is not valid JSON")
+        typer.echo(configmap_raw)
+        return
+
+    data = payload.get("data")
+    if not isinstance(data, dict) or not data:
+        typer.echo(f"{header}: <empty>")
+        return
+
+    if focus_keys:
+        keys = [key for key in focus_keys if key in data]
+        missing = [key for key in focus_keys if key not in data]
+    else:
+        keys = sorted(data)
+        missing = []
+
+    typer.echo(header)
+    for key in keys:
+        typer.echo(f"--- {name}:{key}")
+        typer.echo(data[key].rstrip() or "<empty>")
+    for key in missing:
+        typer.echo(f"--- {name}:{key} <missing>")
 
 
 def extract_node_names(topology_data: Mapping[str, Any]) -> set[str]:
@@ -405,6 +548,7 @@ def apply_topology(
     sim_spec_file: Path,
     topo_ns: str,
     core_ns: str,
+    debug: bool = False,
 ) -> None:
     topology_data: dict[str, Any] | None = None
     if topology_file is not None:
@@ -423,10 +567,23 @@ def apply_topology(
 
     attachments = _collect_sim_attachments(normalized_sim)
     linux_configs = _prepare_linux_interface_configs(normalized_sim, attachments)
-    if _ensure_edge_topolinks(topo_ns=topo_ns, attachments=attachments):
+    edge_plan = _ensure_edge_topolinks(
+        topo_ns=topo_ns, attachments=attachments
+    )
+    topology_snapshot = topology_data
+    if edge_plan.created_manifests:
         typer.echo("Created missing edge TopoLink resources for simulation attachments")
         topology_data = fetch_existing_topology(topo_ns)
-        known_nodes = extract_node_names(topology_data)
+
+    if debug:
+        _emit_apply_debug(
+            topo_ns=topo_ns,
+            normalized_sim=normalized_sim,
+            attachments=attachments,
+            linux_configs=linux_configs,
+            edge_plan=edge_plan,
+            topology_snapshot=topology_snapshot,
+        )
 
     toolbox_pod = find_toolbox_pod(core_ns)
     typer.echo(f"Using toolbox pod {core_ns}/{toolbox_pod}")
@@ -456,10 +613,24 @@ def apply_topology(
     command.extend(["-s", "/tmp/simtopo.json"])
     exec_in_toolbox(core_ns, toolbox_pod, command)
 
-    _configure_linux_interfaces(core_ns=core_ns, configs=linux_configs)
+    _configure_linux_interfaces(core_ns=core_ns, configs=linux_configs, debug=debug)
+
+    if debug:
+        _print_configmap_data(
+            topo_ns,
+            name="eda-topology",
+            header="Debug: eda-topology ConfigMap data",
+            focus_keys=("eda.yaml",),
+        )
+        _print_configmap_data(
+            topo_ns,
+            name="eda-topology-sim",
+            header="Debug: eda-topology-sim ConfigMap data",
+            focus_keys=("sim.yaml",),
+        )
 
 
-def remove_sim_spec(*, topo_ns: str, core_ns: str) -> None:
+def remove_sim_spec(*, topo_ns: str, core_ns: str, debug: bool = False) -> None:
     wipe_sim = """\
 apiVersion: v1
 kind: ConfigMap
@@ -504,6 +675,20 @@ data:
         toolbox_pod,
         ("api-server-topo", "-n", topo_ns, "-f", "/tmp/topo.json"),
     )
+
+    if debug:
+        _print_configmap_data(
+            topo_ns,
+            name="eda-topology",
+            header="Debug: eda-topology ConfigMap data after removal",
+            focus_keys=("eda.yaml",),
+        )
+        _print_configmap_data(
+            topo_ns,
+            name="eda-topology-sim",
+            header="Debug: eda-topology-sim ConfigMap data after removal",
+            focus_keys=("sim.yaml",),
+        )
 
 
 __all__ = [
