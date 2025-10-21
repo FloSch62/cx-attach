@@ -7,33 +7,33 @@ from ..cli.options import (
     DEFAULT_TOPO_NS,
     CoreNamespaceOption,
     DebugOption,
+    EmitCrdsOption,
     SpecOption,
     TopologyNamespaceOption,
-    TopologyOption,
 )
 from ..kubectl import CommandError
-from ..topology import apply_topology
+from ..topology import apply_simulation
 from .utils import handle_cli_error
 
 
 def apply_command(
     spec: SpecOption,
-    topology: TopologyOption = None,
     topology_namespace: TopologyNamespaceOption = DEFAULT_TOPO_NS,
     core_namespace: CoreNamespaceOption = DEFAULT_CORE_NS,
+    emit_crds: EmitCrdsOption = None,
     debug: DebugOption = False,
 ) -> None:
-    """Load topology plus simulation attachments defined in YAML."""
+    """Materialise simulation resources via ETC."""
 
     try:
-        apply_topology(
-            topology_file=topology,
+        apply_simulation(
             sim_spec_file=spec,
             topo_ns=topology_namespace,
             core_ns=core_namespace,
+            emit_crds=emit_crds,
             debug=debug,
         )
-    except (CommandError, ValueError, FileNotFoundError) as exc:  # pragma: no cover
+    except (CommandError, ValueError, FileNotFoundError, RuntimeError) as exc:  # pragma: no cover
         handle_cli_error(exc)
 
 

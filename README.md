@@ -1,92 +1,121 @@
 # CX Attach Utility
 
 <p align="center">
-  Manage EDA simulation attachments safely from the command line.
+  Render and manage EDA simulation CRDs with a single CLI.
 </p>
 
-Integrate container-based simulations with an existing [EDA CX fabric](https://docs.eda.dev) while keeping production TopoNodes and TopoLinks untouched. The CLI wraps the usual `kubectl` dance together with `api-server-topo` so you can stage or tear down simulations with a single command.
+`cx-attach` turns a compact simulation spec into the full set of
+`SimNode`, `SimLink`, and edge `TopoLink` resources that EDA expects. It renders
+those manifests locally, applies them transactionally via the
+[ETC script](https://github.com/eda-labs/etc-script), waits for the backing pods
+and finalises their VLAN/IP configuration. Teardown follows the same path in
+reverse with `etc delete`.
 
 ## Overview
 
-Ad-hoc simulation endpoints are useful for testing, but pushing those changes manually is tedious and error-prone. `cx-attach` streamlines the workflow by:
+Running ad-hoc simulations usually means juggling YAML, `kubectl apply`, and a
+few manual `exec` calls. This CLI streamlines the workflow:
 
-1. Discovering the active `eda-toolbox` pod in the control namespace.
-2. Collecting (or loading) the fabric topology JSON.
-3. Validating and normalizing the simulation specification.
-4. Copying both assets to the toolbox pod and invoking `api-server-topo` appropriately.
-
-The result is a single Typer command that safely layers simulation state on top of the fabric configuration and rolls it back just as easily.
+1. Read the simplified spec (`simNodes`, `topology`) from disk.
+2. Generate a multi-document YAML containing all required CRDs.
+3. Call `etc apply` (dry-run first, then real apply) to create/update resources.
+4. Wait for simulation pods (`cx-pod-name=<SimNode>`) to become Ready.
+5. Configure VLAN/IP information inside each pod and optionally dump state for
+   debugging.
+6. Re-render the same bundle for `etc delete` when it is time to tear everything
+   down.
 
 ## Prerequisites
 
 - **CLI runtime**
-  - Python 3.11+ (handled automatically when using `uv`)
-  - [uv](https://docs.astral.sh/uv) available on your `PATH`
+  - Python 3.11+ (managed automatically when using `uv`).
+  - [`uv`](https://docs.astral.sh/uv/) available on your `PATH`.
 - **Cluster access**
-  - `kubectl` configured for the target cluster
-  - Network reachability between your workstation and the Kubernetes API
+  - `kubectl` configured for the target cluster and reachable API server.
 - **EDA specifics**
-  - At least one healthy `eda-toolbox` pod in the chosen core namespace
-  - Existing fabric topology stored as `TopoNode`/`TopoLink` resources if you intend to reuse the live snapshot
+  - The ETC helper installed locally:
+    ```bash
+    curl -o etc https://raw.githubusercontent.com/eda-labs/etc-script/refs/heads/main/etc.sh
+    chmod +x etc
+    sudo mv etc /usr/local/bin/etc
+    ```
+  - A healthy `eda-toolbox` pod in the control namespace handling `etc` calls.
 
 ## Installation
 
 > [!TIP]
-> **Why uv?** `uv` manages Python versions, virtual environments, and dependency resolution in one step—and is significantly faster than `pip`.
+> **Why uv?** `uv` handles Python versions, dependency resolution, and
+> virtualenv management in one concise command.
 
-1. **Sync dependencies**
+1. Synchronise dependencies:
    ```bash
    uv sync
    ```
-   This creates an isolated environment pinned to `pyproject.toml`.
-2. **Activate the CLI**
-   Use `uv run` to execute commands inside that environment without sourcing anything manually.
+2. Use `uv run` for all invocations so you never have to activate a venv
+   manually.
 
 ## Usage
 
-Both `cx-attach` and `cx_attach` entry points are exposed. Prefix commands with `uv run` to avoid managing virtualenvs manually.
+Both entry points `cx-attach` and `cx_attach` are exposed. Prefix each invocation
+with `uv run`:
 
 ```bash
-uv run cx_attach apply --spec examples/demo_sim.yaml
-uv run cx_attach apply --spec examples/demo_sim.yaml --topology examples/demo_topology.yaml
-uv run cx_attach remove
+uv run cx_attach apply --spec examples/demo_sim2.yaml
+uv run cx_attach apply --spec examples/demo_sim2.yaml --emit-crds /tmp/sim.yaml
+uv run cx_attach remove --spec examples/demo_sim2.yaml
 ```
 
 ### Common options
 
 | Option | Required | Default | Description |
 |--------|----------|---------|-------------|
-| `--spec`, `-s` | Yes | None | Path to the simulation YAML input |
-| `--topology`, `-t` | No | None | Fabric topology YAML; omit to snapshot live TopoNode/TopoLink state |
-| `--topology-namespace`, `-n` | No | `eda` | Namespace containing TopoNode/TopoLink ConfigMaps (`TOPO_NS`) |
-| `--core-namespace`, `-c` | No | `eda-system` | Namespace hosting the `eda-toolbox` pod (`CORE_NS`) |
+| `--spec`, `-s` | Yes | — | Path to the simplified simulation spec YAML |
+| `--emit-crds` | No | temp file | Persist the rendered CRDs to a path for inspection |
+| `--topology-namespace`, `-n` | No | `eda` | Namespace for `SimNode`/`SimLink`/`TopoLink` resources (`TOPO_NS`) |
+| `--core-namespace`, `-c` | No | `eda-system` | Namespace containing the simulation pods (`CORE_NS`) |
+| `--debug` | No | `False` | Print the generated YAML, ETC dry-run output, and extra `kubectl` dumps |
 
-Environment variables `TOPO_NS` and `CORE_NS` provide the same overrides without using flags.
+The environment variables `TOPO_NS` and `CORE_NS` provide the same overrides as
+the matching options.
 
 ### `apply`
 
-- Collects the fabric topology from the cluster when `--topology` is not provided.
-- Validates the simulation spec against known fabric nodes to catch typos early.
-- Copies `/tmp/topo.json` and `/tmp/simtopo.json` to the toolbox pod.
-- Executes `api-server-topo -n <namespace> [-f topo.json] -s simtopo.json` to activate the configuration.
+1. Renders `SimNode`, `SimLink`, and `TopoLink` manifests into a single
+   multi-document YAML (written to `/tmp/cx-attach-*.yaml` unless `--emit-crds`
+   is provided).
+2. Executes `etc apply -f <file> --dry-run` and aborts if validation fails.
+3. Executes `etc apply -f <file>` and reports the created/updated resources.
+4. Waits for every simulation pod and configures VLAN/IP data via `kubectl
+   exec`.
+5. When `--debug` is set, prints the manifest, ETC output, and
+   `kubectl get simnodes/simlinks` snapshots.
 
 ### `remove`
 
-- Resets the `eda-topology-sim` ConfigMap by applying an empty payload.
-- Refreshes `/tmp/topo.json` from the current TopoNode/TopoLink state.
-- Triggers `api-server-topo -f /tmp/topo.json` to reapply the clean fabric configuration.
+1. Re-renders the same manifest from the spec.
+2. Executes `etc delete -f <file> --dry-run` followed by the real delete.
+3. Checks for leftover resources labelled `eda.nokia.com/simtopology=true` and
+   warns if they remain.
+4. The `--debug` flag triggers the same inspection helpers as `apply`.
 
 ## Simulation spec format
 
-The CLI accepts either the concise structure below or the full EDA `items/spec` schema. Keys `node` / `interface` refer to fabric elements, while `simNode` / `simNodeInterface` describe the container edge.
+The CLI accepts either the concise structure below or the full `items/spec`
+layout used by EDA. Keys `node`/`interface` describe the fabric side, while
+`simNode`/`simNodeInterface` identify the simulation containers.
 
 ```yaml
 simNodes:
   - name: edge-server
     image: ghcr.io/srl-labs/network-multitool:v0.4.1
     type: Linux
+    ipAddress: 10.10.0.11/24
+    vlan: 1001
   - name: test-client
     image: ghcr.io/srl-labs/network-multitool:v0.4.1
+    type: Linux
+    ipAddress: 10.10.0.12/24
+    vlan: 1001
 
 topology:
   - node: leaf1
@@ -99,95 +128,34 @@ topology:
     simNodeInterface: eth1
 ```
 
-Validation ensures required keys exist and, when a fabric snapshot is available, that each `node` appears in the current topology.
-
-## Topology file format
-
-When you pass `--topology`, the CLI expects the same nested structure exposed by the cluster (items → spec → nodes/links). The sample file `examples/demo_topology.yaml` defines two nodes connected by a single fabric link:
-
-```yaml
-items:
-  - spec:
-      nodes:
-        - name: leaf1
-          labels:
-            eda.nokia.com/role: leaf
-            eda.nokia.com/security-profile: managed
-          spec:
-            operatingSystem: srl
-            platform: 7220 IXR-D2L
-            version: 25.7.2
-            nodeProfile: srlinux-ghcr-25.7.2
-            npp:
-              mode: normal
-        - name: leaf2
-          labels:
-            eda.nokia.com/role: leaf
-            eda.nokia.com/security-profile: managed
-          spec:
-            operatingSystem: srl
-            platform: 7220 IXR-D2L
-            version: 25.7.2
-            nodeProfile: srlinux-ghcr-25.7.2
-            npp:
-              mode: normal
-        - name: spine1
-          labels:
-            eda.nokia.com/role: spine
-            eda.nokia.com/security-profile: managed
-          spec:
-            operatingSystem: srl
-            platform: 7220 IXR-D3L
-            version: 25.7.2
-            nodeProfile: srlinux-ghcr-25.7.2
-            npp:
-              mode: normal
-      links:
-        - name: leaf1-spine1
-          labels:
-            eda.nokia.com/role: interSwitch
-          spec:
-            links:
-              - local:
-                  interface: ethernet-1-49
-                  node: leaf1
-                remote:
-                  interface: ethernet-1-1
-                  node: spine1
-                type: interSwitch
-        - name: leaf2-spine1
-          labels:
-            eda.nokia.com/role: interSwitch
-          spec:
-            links:
-              - local:
-                  interface: ethernet-1-49
-                  node: leaf2
-                remote:
-                  interface: ethernet-1-2
-                  node: spine1
-                type: interSwitch
-```
-
-See `examples/demo_topology.yaml` for the trimmed snapshot captured from your cluster. Ensure the node names match your target fabric so simulation validation succeeds.
+Per-node values such as `ipAddress` and `vlan` are consumed to configure the
+pods after they start; the CRDs themselves stay minimal and contain only the
+fields accepted by the official schema (`containerImage`, `operatingSystem`,
+optionally `platform`, `version`, `dhcp`, …). Attachments may provide a `vlan`
+override that is also applied during the post-configuration step.
 
 ## Typical workflow
 
-1. Prepare or update your simulation YAML file.
-2. Export `TOPO_NS`/`CORE_NS` or supply the matching flags.
-3. Run `uv run cx_attach apply --spec path/to/sim.yaml` to stage the simulation.
-4. Observe toolbox pod logs and ConfigMaps to confirm activation.
-5. Run `uv run cx_attach remove` once the simulation should be torn down.
+1. Edit the simulation spec (`examples/demo_sim2.yaml` is a good starting
+   template).
+2. Export `TOPO_NS`/`CORE_NS` (or pass the CLI options).
+3. Run `uv run cx_attach apply --spec <file>` and monitor the ETC dry-run logs.
+4. Use `kubectl get simnodes -n "$TOPO_NS" -o wide` to inspect the CRDs if
+   needed.
+5. Once the test is complete, run `uv run cx_attach remove --spec <file>` to
+   delete the resources atomically.
 
 ## Inspecting cluster state
 
 ```bash
-kubectl -n "$TOPO_NS" get toponodes
-kubectl -n "$TOPO_NS" get configmap eda-topology-sim -o yaml
-kubectl -n "$CORE_NS" get pods -l eda.nokia.com/app=eda-toolbox
+kubectl -n "$TOPO_NS" get simnodes -o wide
+kubectl -n "$TOPO_NS" get simlinks -o yaml
+kubectl -n "$TOPO_NS" get topolinks -l eda.nokia.com/simtopology=true -o yaml
+kubectl -n "$CORE_NS" get pods -l cx-pod-name
 ```
 
-Need a refresher on the underlying resources? Consult the [EDA documentation](https://docs.eda.dev/).
+Need a deeper explanation of the generated artefacts? Have a look at
+`docs/demo_sim2_ablauf.md` for the end-to-end rundown.
 
 ## Development
 

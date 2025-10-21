@@ -1,288 +1,327 @@
-"""Topology helpers and operations for cx-attach."""
+"""Simulation workflow built around ETC apply/delete operations."""
 
 from __future__ import annotations
 
-import json
-import re
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import typer
 import yaml
 
-from .kubectl import (
-    CommandError,
-    copy_to_toolbox,
-    exec_in_toolbox,
-    find_toolbox_pod,
-    load_namespace_resource,
-    run_command,
+from .kubectl import CommandError, run_command
+from .specs import (
+    SIMNODE_ALLOWED_FIELDS,
+    AttachmentSpec,
+    SimNodeSpec,
+    SimulationSpec,
+    parse_simulation_spec,
+    read_yaml,
 )
-from .specs import normalize_sim_spec, read_yaml
 
 
-def _build_node_entry(node: Mapping[str, Any]) -> dict[str, Any] | None:
-    metadata = node.get("metadata") if isinstance(node, Mapping) else None
-    spec = node.get("spec") if isinstance(node, Mapping) else None
-    if not isinstance(metadata, Mapping):
-        return None
+@dataclass(frozen=True)
+class ResourceSummary:
+    """Light-weight reference to a rendered resource."""
 
-    name = metadata.get("name")
-    if not isinstance(name, str):
-        return None
-
-    entry: dict[str, Any] = {"name": name}
-
-    labels = metadata.get("labels")
-    if isinstance(labels, Mapping) and labels:
-        entry["labels"] = dict(labels)
-
-    spec_mapping = spec if isinstance(spec, Mapping) else {}
-    node_spec: dict[str, Any] = {
-        key: spec_mapping[key]
-        for key in ("operatingSystem", "platform", "version", "nodeProfile")
-        if key in spec_mapping
-    }
-    for optional in ("npp", "productionAddress"):
-        if optional in spec_mapping:
-            node_spec[optional] = spec_mapping[optional]
-    if node_spec:
-        entry["spec"] = node_spec
-
-    return entry
+    kind: str
+    name: str
 
 
-def _build_link_entry(link: Mapping[str, Any]) -> dict[str, Any] | None:
-    metadata = link.get("metadata") if isinstance(link, Mapping) else None
-    spec = link.get("spec") if isinstance(link, Mapping) else None
-    if not isinstance(metadata, Mapping):
-        return None
+@dataclass(frozen=True)
+class NodeInterfaceConfig:
+    """Information required to configure VLAN/IP inside a pod."""
 
-    name = metadata.get("name")
-    if not isinstance(name, str):
-        return None
-
-    entry: dict[str, Any] = {"name": name}
-
-    labels = metadata.get("labels")
-    if isinstance(labels, Mapping) and labels:
-        entry["labels"] = dict(labels)
-
-    spec_mapping = spec if isinstance(spec, Mapping) else {}
-    if "encapType" in spec_mapping:
-        entry["encapType"] = spec_mapping["encapType"]
-
-    links_value = spec_mapping.get("links")
-    if isinstance(links_value, list):
-        entry.setdefault("spec", {})["links"] = links_value
-
-    return entry
+    name: str
+    interface: str
+    ip_address: str
+    vlan: str | None
 
 
-def fetch_existing_topology(namespace: str) -> dict[str, Any]:
-    nodes_raw = load_namespace_resource(namespace, "toponodes")
-    if not nodes_raw:
-        raise ValueError(
-            "No TopoNode resources found; provide --topology to avoid clearing the fabric."
-        )
+@dataclass(frozen=True)
+class RenderedBundle:
+    """Rendered simulation manifests alongside operational metadata."""
 
-    links_raw = load_namespace_resource(namespace, "topolinks")
-
-    nodes = [
-        node_entry
-        for raw in nodes_raw
-        if (node_entry := _build_node_entry(raw)) is not None
-    ]
-
-    links = [
-        link_entry
-        for raw in links_raw
-        if (link_entry := _build_link_entry(raw)) is not None
-    ]
-
-    return {"items": [{"spec": {"nodes": nodes, "links": links}}]}
+    manifest_text: str
+    summaries: list[ResourceSummary]
+    node_configs: list[NodeInterfaceConfig]
+    sim_nodes: list[str]
 
 
 def _slugify(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
-    slug = re.sub(r"-+", "-", slug).strip("-")
-    return slug or "sim"
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in value)
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-") or "sim"
 
 
-def _collect_sim_attachments(sim_spec: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    attachments: list[Mapping[str, Any]] = []
-    items = sim_spec.get("items") if isinstance(sim_spec, Mapping) else None
-    if not isinstance(items, list):
-        return attachments
-
-    for item in items:
-        spec = item.get("spec") if isinstance(item, Mapping) else None
-        topology = spec.get("topology") if isinstance(spec, Mapping) else None
-        if isinstance(topology, list):
-            attachments.extend(
-                entry for entry in topology if isinstance(entry, Mapping)
-            )
-    return attachments
-
-
-@dataclass(slots=True)
-class EdgeLinkPlan:
-    created_manifests: list[str]
-    created_links: list[str]
-    reused_links: list[str]
-
-
-def _ensure_edge_topolinks(
-    *,
-    topo_ns: str,
-    attachments: list[Mapping[str, Any]],
-) -> EdgeLinkPlan:
-    if not attachments:
-        return EdgeLinkPlan([], [], [])
-
-    existing_links = {
-        item.get("metadata", {}).get("name")
-        for item in load_namespace_resource(topo_ns, "topolinks")
-        if isinstance(item, Mapping)
+def _string_map(payload: dict[str, object] | None) -> dict[str, str]:
+    if not payload:
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in payload.items()
+        if isinstance(key, str) and value is not None
     }
 
-    manifests: list[str] = []
-    created_summaries: list[str] = []
-    reused_summaries: list[str] = []
-    for entry in attachments:
-        node = entry.get("node")
-        interface = entry.get("interface")
-        sim_node = entry.get("simNode")
-        sim_interface = entry.get("simNodeInterface")
 
-        if not all(
-            isinstance(value, str) and value
-            for value in (node, interface, sim_node, sim_interface)
-        ):
-            continue
+def _attachments_by_node(attachments: Iterable[AttachmentSpec]) -> dict[str, list[AttachmentSpec]]:
+    grouped: dict[str, list[AttachmentSpec]] = {}
+    for attachment in attachments:
+        grouped.setdefault(attachment.sim_node, []).append(attachment)
+    return grouped
 
-        link_name = "-".join(
-            (
-                _slugify(node),
-                _slugify(interface),
-                _slugify(sim_node),
-            )
+
+def _select_vlan(node: SimNodeSpec, attachments: list[AttachmentSpec]) -> str | None:
+    if node.vlan:
+        return node.vlan
+    for attachment in attachments:
+        if attachment.vlan:
+            return attachment.vlan
+    return None
+
+
+def _select_interface(node: SimNodeSpec, attachments: list[AttachmentSpec]) -> str | None:
+    if node.interface:
+        return node.interface
+    for attachment in attachments:
+        if attachment.sim_interface:
+            return attachment.sim_interface
+    return None
+
+
+def _render_simnode(
+    *,
+    node: SimNodeSpec,
+    namespace: str,
+    attachments: list[AttachmentSpec],
+) -> tuple[dict[str, object], NodeInterfaceConfig | None]:
+    vlan = _select_vlan(node, attachments)
+    interface = _select_interface(node, attachments)
+
+    metadata = {
+        "name": node.name,
+        "namespace": namespace,
+        "labels": {
+            "eda.nokia.com/simtopology": "true",
+        },
+    }
+
+    node_labels = node.raw.get("labels")
+    if isinstance(node_labels, dict):
+        metadata.setdefault("labels", {}).update(_string_map(node_labels))
+
+    annotations = node.raw.get("annotations")
+    if isinstance(annotations, dict):
+        metadata["annotations"] = _string_map(annotations)
+
+    spec: dict[str, object] = {
+        "containerImage": node.image,
+        "operatingSystem": node.node_type.lower(),
+    }
+
+    defaults: dict[str, object] = {
+        "dhcp": {},
+    }
+    if node.node_type.lower() == "linux":
+        defaults.setdefault("port", 57400)
+        defaults.setdefault("serialNumberPath", "")
+        defaults.setdefault("versionPath", "")
+    for key, value in defaults.items():
+        spec.setdefault(key, value)
+
+    allowed_top_level = {
+        key: node.raw[key]
+        for key in SIMNODE_ALLOWED_FIELDS
+        if key in node.raw and node.raw[key] is not None
+    }
+    spec.update(allowed_top_level)
+    if node.spec_overrides:
+        spec.update(dict(node.spec_overrides))
+
+    # Ensure canonical fields keep their expected value.
+    spec["containerImage"] = node.image
+    spec["operatingSystem"] = node.node_type.lower()
+
+    manifest = {
+        "apiVersion": "core.eda.nokia.com/v1",
+        "kind": "SimNode",
+        "metadata": metadata,
+        "spec": spec,
+    }
+
+    node_config: NodeInterfaceConfig | None = None
+    if interface and node.ip_address:
+        node_config = NodeInterfaceConfig(
+            name=node.name,
+            interface=interface,
+            ip_address=node.ip_address,
+            vlan=vlan,
         )
 
-        summary = (
-            f"{link_name}: {node} {interface} -> {sim_node} {sim_interface}"
+    return manifest, node_config
+
+
+def _render_simlink(
+    *,
+    attachment: AttachmentSpec,
+    namespace: str,
+) -> dict[str, object]:
+    link_name = "-".join(
+        (
+            _slugify(attachment.fabric_node),
+            _slugify(attachment.fabric_interface),
+            _slugify(attachment.sim_node),
         )
+    )
 
-        if link_name in existing_links:
-            reused_summaries.append(summary)
-            continue
+    spec_link = {
+        "local": {
+            "node": attachment.fabric_node,
+            "interface": attachment.fabric_interface,
+            "interfaceResource": f"{_slugify(attachment.fabric_node)}-{_slugify(attachment.fabric_interface)}",
+        },
+        "sim": {
+            "node": attachment.sim_node,
+            "interface": attachment.sim_interface,
+            "interfaceResource": f"{_slugify(attachment.sim_node)}-{_slugify(attachment.sim_interface)}",
+        },
+    }
 
-        manifest = {
-            "apiVersion": "core.eda.nokia.com/v1",
-            "kind": "TopoLink",
-            "metadata": {
-                "name": link_name,
-                "namespace": topo_ns,
-                "labels": {
-                    "eda.nokia.com/role": "edge",
-                    "eda.nokia.com/simtopology": "true",
-                },
+    return {
+        "apiVersion": "core.eda.nokia.com/v1",
+        "kind": "SimLink",
+        "metadata": {
+            "name": link_name,
+            "namespace": namespace,
+            "labels": {
+                "eda.nokia.com/simtopology": "true",
             },
-            "spec": {
-                "links": [
-                    {
-                        "type": "edge",
-                        "local": {
-                            "node": node,
-                            "interface": interface,
-                            "interfaceResource": f"{_slugify(node)}-{_slugify(interface)}",
-                        },
-                        "remote": {
-                            "node": sim_node,
-                            "interface": sim_interface,
-                            "interfaceResource": f"{_slugify(sim_node)}-{_slugify(sim_interface)}",
-                        },
-                    }
-                ]
+        },
+        "spec": {
+            "links": [spec_link],
+        },
+    }
+
+
+def _render_topolink(*, attachment: AttachmentSpec, namespace: str) -> dict[str, object]:
+    link_name = "-".join(
+        (
+            _slugify(attachment.fabric_node),
+            _slugify(attachment.fabric_interface),
+            _slugify(attachment.sim_node),
+        )
+    )
+
+    local_interface_resource = f"{_slugify(attachment.fabric_node)}-{_slugify(attachment.fabric_interface)}"
+    remote_interface_resource = f"{_slugify(attachment.sim_node)}-{_slugify(attachment.sim_interface)}"
+
+    return {
+        "apiVersion": "core.eda.nokia.com/v1",
+        "kind": "TopoLink",
+        "metadata": {
+            "name": link_name,
+            "namespace": namespace,
+            "labels": {
+                "eda.nokia.com/role": "edge",
+                "eda.nokia.com/simtopology": "true",
             },
-        }
-
-        manifests.append(yaml.safe_dump(manifest, sort_keys=False))
-        existing_links.add(link_name)
-        created_summaries.append(summary)
-
-    if not manifests:
-        return EdgeLinkPlan([], created_summaries, reused_summaries)
-
-    payload = "---\n".join(manifests)
-    run_command(("kubectl", "apply", "-f", "-"), input_text=payload)
-    return EdgeLinkPlan(manifests, created_summaries, reused_summaries)
-
-
-def _prepare_linux_interface_configs(
-    sim_spec: Mapping[str, Any], attachments: list[Mapping[str, Any]]
-) -> list[dict[str, str]]:
-    interface_map: dict[str, list[str]] = {}
-    attachment_vlans: dict[str, str] = {}
-    for entry in attachments:
-        sim_node = entry.get("simNode")
-        sim_interface = entry.get("simNodeInterface")
-        vlan = entry.get("vlan")
-        if isinstance(sim_node, str) and isinstance(sim_interface, str):
-            interfaces = interface_map.setdefault(sim_node, [])
-            if sim_interface not in interfaces:
-                interfaces.append(sim_interface)
-            if isinstance(vlan, (str, int)) and sim_node not in attachment_vlans:
-                attachment_vlans[sim_node] = str(vlan)
-
-    configs: list[dict[str, str]] = []
-    items = sim_spec.get("items") if isinstance(sim_spec, Mapping) else None
-    if not isinstance(items, list):
-        return configs
-
-    for item in items:
-        spec = item.get("spec") if isinstance(item, Mapping) else None
-        sim_nodes = spec.get("simNodes") if isinstance(spec, Mapping) else None
-        if not isinstance(sim_nodes, list):
-            continue
-        for node in sim_nodes:
-            if not isinstance(node, Mapping):
-                continue
-            name = node.get("name")
-            node_type = node.get("type", "Linux")
-            ip_addr = node.get("ipAddress") or node.get("ip")
-            if not (
-                isinstance(name, str)
-                and isinstance(node_type, str)
-                and node_type.lower() == "linux"
-                and isinstance(ip_addr, str)
-            ):
-                continue
-            interfaces = interface_map.get(name)
-            if not interfaces:
-                continue
-            interface_name = interfaces[0]
-            vlan_value = node.get("vlan")
-            if isinstance(vlan_value, (str, int)):
-                vlan_str = str(vlan_value)
-            else:
-                vlan_str = attachment_vlans.get(name, "")
-            configs.append(
+        },
+        "spec": {
+            "links": [
                 {
-                    "name": name,
-                    "interface": interface_name,
-                    "ip": ip_addr,
-                    "vlan": vlan_str,
+                    "type": "edge",
+                    "local": {
+                        "node": attachment.fabric_node,
+                        "interface": attachment.fabric_interface,
+                        "interfaceResource": local_interface_resource,
+                    },
+                    "remote": {
+                        "node": attachment.sim_node,
+                        "interface": attachment.sim_interface,
+                        "interfaceResource": remote_interface_resource,
+                    },
                 }
-            )
-    return configs
+            ],
+        },
+    }
 
 
-def _wait_for_sim_pod(core_ns: str, sim_node: str, *, debug: bool = False) -> str:
+def _render_bundle(spec: SimulationSpec, *, namespace: str) -> RenderedBundle:
+    attachments_grouped = _attachments_by_node(spec.attachments)
+    documents: list[str] = []
+    summaries: list[ResourceSummary] = []
+    node_configs: list[NodeInterfaceConfig] = []
+
+    for node in spec.ordered_nodes:
+        attachments = attachments_grouped.get(node.name, [])
+        manifest, config = _render_simnode(
+            node=node,
+            namespace=namespace,
+            attachments=attachments,
+        )
+        documents.append(yaml.safe_dump(manifest, sort_keys=False).rstrip())
+        summaries.append(ResourceSummary(kind="SimNode", name=node.name))
+        if config is not None:
+            node_configs.append(config)
+
+    for attachment in spec.attachments:
+        simlink_manifest = _render_simlink(
+            attachment=attachment,
+            namespace=namespace,
+        )
+        documents.append(yaml.safe_dump(simlink_manifest, sort_keys=False).rstrip())
+        summaries.append(
+            ResourceSummary(kind="SimLink", name=simlink_manifest["metadata"]["name"])
+        )
+
+    for attachment in spec.attachments:
+        topolink_manifest = _render_topolink(attachment=attachment, namespace=namespace)
+        documents.append(yaml.safe_dump(topolink_manifest, sort_keys=False).rstrip())
+        summaries.append(
+            ResourceSummary(kind="TopoLink", name=topolink_manifest["metadata"]["name"])
+        )
+
+    manifest_text = "\n---\n".join(documents) + "\n"
+    sim_nodes = [node.name for node in spec.ordered_nodes]
+    return RenderedBundle(
+        manifest_text=manifest_text,
+        summaries=summaries,
+        node_configs=node_configs,
+        sim_nodes=sim_nodes,
+    )
+
+
+def _write_manifest(text: str, *, target: Path | None) -> Path:
+    if target is not None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".yaml", prefix="cx-attach-", delete=False) as handle:
+        handle.write(text)
+        return Path(handle.name)
+
+
+def _group_summaries(summaries: Iterable[ResourceSummary]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for summary in summaries:
+        grouped.setdefault(summary.kind, []).append(summary.name)
+    return grouped
+
+
+def _run_etc(command: Iterable[str], *, debug: bool) -> str:
+    output = run_command(command)
+    if debug:
+        typer.echo("Debug: command output\n" + (output or "<no output>"))
+    elif output:
+        typer.echo(output)
+    return output
+
+
+def _wait_for_sim_pod(core_ns: str, sim_node: str, *, debug: bool) -> str:
     selector = f"cx-pod-name={sim_node}"
     deadline = time.time() + 180
     pod_name = ""
@@ -312,9 +351,9 @@ def _wait_for_sim_pod(core_ns: str, sim_node: str, *, debug: bool = False) -> st
                         "-n",
                         core_ns,
                         "wait",
-                        "--for=condition=Ready",
                         "pod",
                         pod_name,
+                        "--for=condition=Ready",
                         "--timeout=120s",
                     )
                 )
@@ -325,45 +364,49 @@ def _wait_for_sim_pod(core_ns: str, sim_node: str, *, debug: bool = False) -> st
             if debug:
                 typer.echo(f"Debug: pod ready for {sim_node}: {pod_name}")
             return pod_name
-
         time.sleep(2)
 
     raise RuntimeError(f"Timed out waiting for pod backing sim node {sim_node}")
 
 
+def _collect_sim_pods(core_ns: str, sim_nodes: Iterable[str], *, debug: bool) -> dict[str, str]:
+    pods: dict[str, str] = {}
+    for sim_node in sim_nodes:
+        typer.echo(f"Waiting for simulation pod {sim_node}")
+        pods[sim_node] = _wait_for_sim_pod(core_ns, sim_node, debug=debug)
+    return pods
+
+
 def _configure_linux_interfaces(
     *,
     core_ns: str,
-    configs: list[dict[str, str]],
-    debug: bool = False,
+    configs: Iterable[NodeInterfaceConfig],
+    pod_lookup: dict[str, str],
+    debug: bool,
 ) -> None:
-    if not configs:
-        return
-
     for config in configs:
-        sim_node = config["name"]
-        interface = config["interface"]
-        ip_addr = config["ip"]
-        vlan = config.get("vlan")
-        vlan_str = str(vlan) if vlan is not None and str(vlan).strip() else ""
+        vlan_suffix = f".{config.vlan}" if config.vlan else ""
         typer.echo(
-            f"Configuring Linux sim node {sim_node} ({interface}{('.' + vlan_str) if vlan_str else ''} -> {ip_addr})"
+            f"Configuring {config.name}: {config.interface}{vlan_suffix} -> {config.ip_address}"
         )
-        pod_name = _wait_for_sim_pod(core_ns, sim_node, debug=debug)
-        if vlan_str:
-            vlan_iface = f"{interface}.{vlan_str}"
+        pod_name = pod_lookup.get(config.name)
+        if not pod_name:
+            pod_name = _wait_for_sim_pod(core_ns, config.name, debug=debug)
+            pod_lookup[config.name] = pod_name
+        if config.vlan:
+            vlan_iface = f"{config.interface}.{config.vlan}"
             command_str = (
-                f"ip link set {interface} up"
-                f" && (ip link show {vlan_iface} >/dev/null 2>&1 || ip link add link {interface} name {vlan_iface} type vlan id {vlan_str})"
+                f"ip link set {config.interface} up"
+                f" && (ip link show {vlan_iface} >/dev/null 2>&1 || ip link add link {config.interface} name {vlan_iface} type vlan id {config.vlan})"
                 f" && ip link set {vlan_iface} up"
                 f" && ip addr flush dev {vlan_iface}"
-                f" && ip addr add {ip_addr} dev {vlan_iface}"
+                f" && ip addr add {config.ip_address} dev {vlan_iface}"
             )
         else:
             command_str = (
-                f"ip addr flush dev {interface}"
-                f" && ip addr add {ip_addr} dev {interface}"
-                f" && ip link set {interface} up"
+                f"ip addr flush dev {config.interface}"
+                f" && ip addr add {config.ip_address} dev {config.interface}"
+                f" && ip link set {config.interface} up"
             )
         deadline = time.time() + 180
         while True:
@@ -376,7 +419,7 @@ def _configure_linux_interfaces(
                         "exec",
                         pod_name,
                         "-c",
-                        sim_node,
+                        config.name,
                         "--",
                         "sh",
                         "-c",
@@ -397,303 +440,152 @@ def _configure_linux_interfaces(
                     continue
                 raise
 
-
-def _count_topology_elements(topology_data: Mapping[str, Any] | None) -> tuple[int, int]:
-    if not isinstance(topology_data, Mapping):
-        return (0, 0)
-    items = topology_data.get("items")
-    if not isinstance(items, list):
-        return (0, 0)
-    node_count = 0
-    link_count = 0
-    for item in items:
-        if not isinstance(item, Mapping):
-            continue
-        spec = item.get("spec")
-        if not isinstance(spec, Mapping):
-            continue
-        nodes = spec.get("nodes")
-        if isinstance(nodes, list):
-            node_count += len(nodes)
-        links = spec.get("links")
-        if isinstance(links, list):
-            link_count += len(links)
-    return node_count, link_count
-
-
-def _emit_apply_debug(
-    *,
-    topo_ns: str,
-    normalized_sim: Mapping[str, Any],
-    attachments: list[Mapping[str, Any]],
-    linux_configs: list[dict[str, str]],
-    edge_plan: EdgeLinkPlan,
-    topology_snapshot: Mapping[str, Any] | None,
-) -> None:
-    node_count, link_count = _count_topology_elements(topology_snapshot)
-    if node_count or link_count:
-        typer.echo(
-            f"Debug: found {node_count} TopoNodes and {link_count} TopoLinks in namespace {topo_ns}"
-        )
-    typer.echo(
-        f"Debug: merging {len(attachments)} attachment(s) into namespace {topo_ns} (create: {len(edge_plan.created_links)}, reuse: {len(edge_plan.reused_links)})"
-    )
-    typer.echo("Debug: normalized simulation payload")
-    typer.echo(yaml.safe_dump(normalized_sim, sort_keys=False).rstrip())
-    typer.echo("Debug: rendered simtopo.json")
-    typer.echo(json.dumps(normalized_sim, indent=2))
-    if attachments:
-        attachment_dump = yaml.safe_dump(
-            {"attachments": attachments}, sort_keys=False
-        ).rstrip()
-        typer.echo("Debug: desired attachment endpoints")
-        typer.echo(attachment_dump)
-    if edge_plan.reused_links:
-        typer.echo("Debug: reusing existing edge TopoLinks")
-        for summary in edge_plan.reused_links:
-            typer.echo(f"  - {summary}")
-    if edge_plan.created_links:
-        typer.echo("Debug: creating edge TopoLinks")
-        for summary in edge_plan.created_links:
-            typer.echo(f"  - {summary}")
-    if edge_plan.created_manifests:
-        typer.echo("Debug: applied TopoLink manifests")
-        typer.echo("---\n".join(edge_plan.created_manifests).rstrip())
-    if linux_configs:
-        typer.echo("Debug: Linux interface configuration plan")
-        typer.echo(yaml.safe_dump({"interfaces": linux_configs}, sort_keys=False).rstrip())
-
-
-def _print_configmap_data(
-    topo_ns: str,
-    *,
-    name: str,
-    header: str,
-    focus_keys: tuple[str, ...] | None = None,
-) -> None:
-    try:
-        configmap_raw = run_command(
-            (
-                "kubectl",
-                "-n",
-                topo_ns,
-                "get",
-                "configmap",
-                name,
-                "-o",
-                "json",
+        if debug:
+            state = run_command(
+                (
+                    "kubectl",
+                    "-n",
+                    core_ns,
+                    "exec",
+                    pod_name,
+                    "-c",
+                    config.name,
+                    "--",
+                    "ip",
+                    "addr",
+                    "show",
+                    config.interface,
+                )
             )
+            typer.echo(f"Debug: interface state for {config.name}\n{state}")
+
+
+def _dump_simulation_state(namespace: str) -> None:
+    for resource, output_flag in (("simnodes", "-o wide"), ("simlinks", "-o yaml")):
+        cmd = (
+            "kubectl",
+            "-n",
+            namespace,
+            "get",
+            resource,
+            *output_flag.split(),
         )
-    except CommandError as exc:  # pragma: no cover
-        typer.echo(f"Debug: failed to read configmap {name}: {exc}")
-        return
-
-    try:
-        payload = json.loads(configmap_raw)
-    except json.JSONDecodeError:  # pragma: no cover
-        typer.echo(f"Debug: configmap {name} payload is not valid JSON")
-        typer.echo(configmap_raw)
-        return
-
-    data = payload.get("data")
-    if not isinstance(data, dict) or not data:
-        typer.echo(f"{header}: <empty>")
-        return
-
-    if focus_keys:
-        keys = [key for key in focus_keys if key in data]
-        missing = [key for key in focus_keys if key not in data]
-    else:
-        keys = sorted(data)
-        missing = []
-
-    typer.echo(header)
-    for key in keys:
-        typer.echo(f"--- {name}:{key}")
-        typer.echo(data[key].rstrip() or "<empty>")
-    for key in missing:
-        typer.echo(f"--- {name}:{key} <missing>")
-
-
-def extract_node_names(topology_data: Mapping[str, Any]) -> set[str]:
-    items = topology_data.get("items") if isinstance(topology_data, Mapping) else None
-    if not isinstance(items, list):
-        return set()
-
-    names: set[str] = set()
-    for item in items:
-        spec = item.get("spec") if isinstance(item, Mapping) else None
-        nodes = spec.get("nodes") if isinstance(spec, Mapping) else None
-        if not isinstance(nodes, list):
+        try:
+            output = run_command(cmd)
+        except CommandError as exc:
+            typer.echo(f"Debug: failed to run {' '.join(cmd)}: {exc}")
             continue
-        for node in nodes:
-            if not isinstance(node, Mapping):
-                continue
-            name = node.get("name")
-            if isinstance(name, str):
-                names.add(name)
-    return names
+        typer.echo(f"Debug: {' '.join(cmd)}\n{output or '<no output>'}")
 
 
-def write_json_temp(data: Mapping[str, Any], filename: str, directory: Path) -> Path:
-    target = directory / filename
-    with target.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
-    return target
+def _verify_cleanup(namespace: str, summaries: Iterable[ResourceSummary]) -> None:
+    kind_to_resource = {
+        "SimNode": "simnode",
+        "SimLink": "simlink",
+        "TopoLink": "topolink",
+    }
+
+    lingering: list[str] = []
+    for summary in summaries:
+        resource = kind_to_resource.get(summary.kind)
+        if resource is None:
+            continue
+
+        try:
+            run_command(("kubectl", "-n", namespace, "get", resource, summary.name))
+        except CommandError:
+            continue
+        lingering.append(f"{resource}.core.eda.nokia.com/{summary.name}")
+
+    if lingering:
+        typer.echo(
+            "Warning: lingering simulation resources detected:\n" + "\n".join(lingering)
+        )
 
 
-def apply_topology(
+def apply_simulation(
     *,
-    topology_file: Path | None,
     sim_spec_file: Path,
     topo_ns: str,
     core_ns: str,
-    debug: bool = False,
+    emit_crds: Path | None,
+    debug: bool,
 ) -> None:
-    topology_data: dict[str, Any] | None = None
-    if topology_file is not None:
-        topology_data = read_yaml(topology_file)
-    else:
-        typer.echo(
-            f"Collecting existing fabric definition from TopoNode/TopoLink resources in namespace {topo_ns}"
-        )
-        topology_data = fetch_existing_topology(topo_ns)
-
-    known_nodes = extract_node_names(topology_data) if topology_data else None
-
     typer.echo(f"Loading simulation spec from {sim_spec_file}")
     raw_spec = read_yaml(sim_spec_file)
-    normalized_sim = normalize_sim_spec(raw_spec, known_nodes=known_nodes)
-
-    attachments = _collect_sim_attachments(normalized_sim)
-    linux_configs = _prepare_linux_interface_configs(normalized_sim, attachments)
-    edge_plan = _ensure_edge_topolinks(
-        topo_ns=topo_ns, attachments=attachments
-    )
-    topology_snapshot = topology_data
-    if edge_plan.created_manifests:
-        typer.echo("Created missing edge TopoLink resources for simulation attachments")
-        topology_data = fetch_existing_topology(topo_ns)
+    simulation_spec = parse_simulation_spec(raw_spec)
+    bundle = _render_bundle(simulation_spec, namespace=topo_ns)
 
     if debug:
-        _emit_apply_debug(
-            topo_ns=topo_ns,
-            normalized_sim=normalized_sim,
-            attachments=attachments,
-            linux_configs=linux_configs,
-            edge_plan=edge_plan,
-            topology_snapshot=topology_snapshot,
+        typer.echo("Debug: generated simulation manifest")
+        typer.echo(bundle.manifest_text.rstrip())
+
+    manifest_path = _write_manifest(bundle.manifest_text, target=emit_crds)
+    typer.echo(f"Applying simulation bundle with ETC using {manifest_path}")
+    try:
+        typer.echo("Running etc apply --dry-run")
+        _run_etc(("etc", "apply", "-f", str(manifest_path), "--dry-run"), debug=debug)
+        typer.echo("Running etc apply")
+        _run_etc(("etc", "apply", "-f", str(manifest_path)), debug=debug)
+    finally:
+        if emit_crds is None:
+            manifest_path.unlink(missing_ok=True)
+
+    grouped = _group_summaries(bundle.summaries)
+    typer.echo("Updated resources:")
+    for kind, names in grouped.items():
+        typer.echo(f"  {kind}: {', '.join(names)}")
+
+    pod_lookup = _collect_sim_pods(core_ns, bundle.sim_nodes, debug=debug)
+
+    if bundle.node_configs:
+        _configure_linux_interfaces(
+            core_ns=core_ns,
+            configs=bundle.node_configs,
+            pod_lookup=pod_lookup,
+            debug=debug,
         )
-
-    toolbox_pod = find_toolbox_pod(core_ns)
-    typer.echo(f"Using toolbox pod {core_ns}/{toolbox_pod}")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmpdir = Path(tmp)
-        sim_json = write_json_temp(normalized_sim, "simtopo.json", tmpdir)
-        topo_json: Path | None = None
-        if topology_data is not None:
-            topo_json = write_json_temp(topology_data, "topo.json", tmpdir)
-            typer.echo(
-                f"Copying topology JSON to {core_ns}/{toolbox_pod}:/tmp/topo.json"
-            )
-            copy_to_toolbox(core_ns, toolbox_pod, topo_json, "topo.json")
-        else:
-            typer.echo("Skipping fabric topology update; existing config will be reused.")
-
-        typer.echo(
-            f"Copying simulation JSON to {core_ns}/{toolbox_pod}:/tmp/simtopo.json"
-        )
-        copy_to_toolbox(core_ns, toolbox_pod, sim_json, "simtopo.json")
-
-    typer.echo("Applying topology via api-server-topo")
-    command = ["api-server-topo", "-n", topo_ns]
-    if topology_data is not None:
-        command.extend(["-f", "/tmp/topo.json"])
-    command.extend(["-s", "/tmp/simtopo.json"])
-    exec_in_toolbox(core_ns, toolbox_pod, command)
-
-    _configure_linux_interfaces(core_ns=core_ns, configs=linux_configs, debug=debug)
+    else:
+        typer.echo("No Linux interface configuration required")
 
     if debug:
-        _print_configmap_data(
-            topo_ns,
-            name="eda-topology",
-            header="Debug: eda-topology ConfigMap data",
-            focus_keys=("eda.yaml",),
-        )
-        _print_configmap_data(
-            topo_ns,
-            name="eda-topology-sim",
-            header="Debug: eda-topology-sim ConfigMap data",
-            focus_keys=("sim.yaml",),
-        )
+        _dump_simulation_state(topo_ns)
 
 
-def remove_sim_spec(*, topo_ns: str, core_ns: str, debug: bool = False) -> None:
-    wipe_sim = """\
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: eda-topology-sim
-data:
-  sim.yaml: |
-    {}
-"""
-    typer.echo(f"Resetting eda-topology-sim ConfigMap in namespace {topo_ns}")
-    run_command(("kubectl", "-n", topo_ns, "apply", "-f", "-"), input_text=wipe_sim)
-
-    typer.echo("Deleting edge TopoLink resources created for simulations")
-    run_command(
-        (
-            "kubectl",
-            "-n",
-            topo_ns,
-            "delete",
-            "topolinks",
-            "-l",
-            "eda.nokia.com/simtopology=true",
-            "--ignore-not-found",
-        )
-    )
-
-    topology_data = fetch_existing_topology(topo_ns)
-
-    toolbox_pod = find_toolbox_pod(core_ns)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmpdir = Path(tmp)
-        topo_json = write_json_temp(topology_data, "topo.json", tmpdir)
-        typer.echo(
-            f"Copying topology JSON to {core_ns}/{toolbox_pod}:/tmp/topo.json for refresh"
-        )
-        copy_to_toolbox(core_ns, toolbox_pod, topo_json, "topo.json")
-
-    typer.echo("Triggering api-server-topo refresh")
-    exec_in_toolbox(
-        core_ns,
-        toolbox_pod,
-        ("api-server-topo", "-n", topo_ns, "-f", "/tmp/topo.json"),
-    )
+def remove_simulation(
+    *,
+    sim_spec_file: Path,
+    topo_ns: str,
+    core_ns: str,
+    debug: bool,
+) -> None:
+    del core_ns  # core namespace is unused during deletion but kept for CLI symmetry.
+    typer.echo(f"Loading simulation spec from {sim_spec_file}")
+    raw_spec = read_yaml(sim_spec_file)
+    simulation_spec = parse_simulation_spec(raw_spec)
+    bundle = _render_bundle(simulation_spec, namespace=topo_ns)
 
     if debug:
-        _print_configmap_data(
-            topo_ns,
-            name="eda-topology",
-            header="Debug: eda-topology ConfigMap data after removal",
-            focus_keys=("eda.yaml",),
-        )
-        _print_configmap_data(
-            topo_ns,
-            name="eda-topology-sim",
-            header="Debug: eda-topology-sim ConfigMap data after removal",
-            focus_keys=("sim.yaml",),
-        )
+        typer.echo("Debug: generated simulation manifest for deletion")
+        typer.echo(bundle.manifest_text.rstrip())
+
+    manifest_path = _write_manifest(bundle.manifest_text, target=None)
+    typer.echo(f"Deleting simulation bundle with ETC using {manifest_path}")
+    try:
+        typer.echo("Running etc delete --dry-run")
+        _run_etc(("etc", "delete", "-f", str(manifest_path), "--dry-run"), debug=debug)
+        typer.echo("Running etc delete")
+        _run_etc(("etc", "delete", "-f", str(manifest_path)), debug=debug)
+    finally:
+        manifest_path.unlink(missing_ok=True)
+
+    if debug:
+        _dump_simulation_state(topo_ns)
+
+    _verify_cleanup(topo_ns, bundle.summaries)
 
 
 __all__ = [
-    "apply_topology",
-    "extract_node_names",
-    "fetch_existing_topology",
-    "remove_sim_spec",
+    "apply_simulation",
+    "remove_simulation",
 ]

@@ -11,22 +11,6 @@ import typer
 DEFAULT_TOPO_NS = os.environ.get("TOPO_NS", "eda")
 DEFAULT_CORE_NS = os.environ.get("CORE_NS", "eda-system")
 
-TopologyOption = Annotated[
-    Path | None,
-    typer.Option(
-        "--topology",
-        "-t",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        help=(
-            "Optional path to the fabric topology YAML file; omit to leave existing "
-            "fabric untouched."
-        ),
-    ),
-]
-
 SpecOption = Annotated[
     Path,
     typer.Option(
@@ -46,7 +30,7 @@ TopologyNamespaceOption = Annotated[
         "--topology-namespace",
         "-n",
         envvar="TOPO_NS",
-        help="Namespace containing the EDA topology ConfigMaps.",
+        help="Namespace containing the simulation CRDs.",
     ),
 ]
 
@@ -57,6 +41,18 @@ CoreNamespaceOption = Annotated[
         "-c",
         envvar="CORE_NS",
         help="Namespace hosting the eda-toolbox pod.",
+    ),
+]
+
+EmitCrdsOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--emit-crds",
+        file_okay=True,
+        dir_okay=False,
+        writable=True,
+        resolve_path=True,
+        help="Persist the generated CRDs to the provided path for inspection.",
     ),
 ]
 
@@ -75,7 +71,7 @@ __all__ = [
     "DEFAULT_TOPO_NS",
     "CoreNamespaceOption",
     "DebugOption",
+    "EmitCrdsOption",
     "SpecOption",
     "TopologyNamespaceOption",
-    "TopologyOption",
 ]
